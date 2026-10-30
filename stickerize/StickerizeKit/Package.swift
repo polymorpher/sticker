@@ -11,7 +11,7 @@ let package = Package(
         .library(name: "StickerizeKit", targets: ["StickerizeKit"]),
         // Vision subject lifting and outlines. Used by the app, the Share extension and the CLI.
         .library(name: "StickerLift", targets: ["StickerLift"]),
-        // WhatsApp / Telegram sticker-pack payloads (WebP via libwebp). Used by the app only.
+        // WhatsApp / Telegram sticker-pack payloads (WebP via libwebp) and Signal Desktop pack prep. Used by the app and CLI.
         .library(name: "StickerExport", targets: ["StickerExport"]),
         .executable(name: "stickerize", targets: ["stickerize"]),
     ],
@@ -26,7 +26,7 @@ let package = Package(
             "StickerizeKit",
             .product(name: "libwebp", package: "libwebp-Xcode"),
         ]),
-        .executableTarget(name: "stickerize", dependencies: ["StickerizeKit", "StickerLift"]),
+        .executableTarget(name: "stickerize", dependencies: ["StickerizeKit", "StickerLift", "StickerExport"]),
         .testTarget(name: "StickerizeKitTests", dependencies: ["StickerizeKit"]),
         .testTarget(name: "StickerLiftTests", dependencies: ["StickerizeKit", "StickerLift"]),
         .testTarget(name: "StickerExportTests", dependencies: ["StickerizeKit", "StickerExport"]),

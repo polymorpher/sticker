@@ -31,6 +31,33 @@ public struct AnimatedFrames: Sendable {
         }
         return AnimatedFrames(frames: frames, delays: delays, loopCount: loopCount)
     }
+
+    public var framesPerSecond: Double { Double(frames.count) / max(duration, 0.01) }
+
+    /// Keeps at most one frame per 1/`target` second slot of the timeline (the first frame that starts in each slot),
+    /// adding the dropped frames' time to the kept ones so the timing is unchanged. Unlike `keepingEvery(2)` this can go
+    /// from 10 fps to 8 rather than to 5, and it thins a fast burst even when a long hold keeps the average rate low.
+    /// Frames are dropped only where two start in the same slot.
+    public func resampled(toFramesPerSecond target: Double) -> AnimatedFrames {
+        guard target > 0, frames.count > 1 else { return self }
+        let slot = 1 / target
+        var frames: [CGImage] = []
+        var delays: [Double] = []
+        var time = 0.0
+        var lastSlot = -1
+        for (frame, delay) in zip(self.frames, self.delays) {
+            let index = Int(((time + 1e-6) / slot).rounded(.down))
+            if index > lastSlot {
+                frames.append(frame)
+                delays.append(delay)
+                lastSlot = index
+            } else {
+                delays[delays.count - 1] += delay
+            }
+            time += delay
+        }
+        return AnimatedFrames(frames: frames, delays: delays, loopCount: loopCount)
+    }
 }
 
 public enum AnimatedImageLoader {
@@ -147,16 +174,8 @@ public enum AnimatedStickerEncoder {
             let contentHeight = max(1, Int((Double(first.height) * scale).rounded()))
             let width = max(contentWidth, canvas.minPixelDimension)
             let height = max(contentHeight, canvas.minPixelDimension)
-            let rendered = try current.frames.map { frame in
-                guard let context = ImageOps.makeRGBAContext(width: width, height: height) else {
-                    throw StickerEncodingError.encodeFailed
-                }
-                context.interpolationQuality = .high
-                context.draw(frame, in: CGRect(x: (width - contentWidth) / 2, y: (height - contentHeight) / 2,
-                                               width: contentWidth, height: contentHeight))
-                guard let image = context.makeImage() else { throw StickerEncodingError.encodeFailed }
-                return image
-            }
+            let rendered = try render(current.frames, contentWidth: contentWidth, contentHeight: contentHeight,
+                                      canvasWidth: width, canvasHeight: height)
             let data = try gifData(frames: rendered, delays: current.delays, loopCount: current.loopCount)
             if data.count <= canvas.maxBytes {
                 return EncodedSticker(data: data, format: .gif, pixelWidth: width, pixelHeight: height)
@@ -197,5 +216,42 @@ public enum AnimatedStickerEncoder {
         }
         guard CGImageDestinationFinalize(destination) else { throw StickerEncodingError.encodeFailed }
         return data as Data
+    }
+
+    /// Writes an animated PNG (APNG). Signal Desktop sticker packs accept APNG, not GIF.
+    public static func apngData(frames: [CGImage], delays: [Double], loopCount: Int) throws -> Data {
+        guard !frames.isEmpty, frames.count == delays.count else { throw StickerEncodingError.invalidImage }
+        let data = NSMutableData()
+        guard let destination = CGImageDestinationCreateWithData(data, UTType.png.identifier as CFString, frames.count, nil) else {
+            throw StickerEncodingError.encodeFailed
+        }
+        CGImageDestinationSetProperties(destination, [
+            kCGImagePropertyPNGDictionary: [kCGImagePropertyAPNGLoopCount: loopCount],
+        ] as CFDictionary)
+        for (frame, delay) in zip(frames, delays) {
+            CGImageDestinationAddImage(destination, frame, [
+                kCGImagePropertyPNGDictionary: [
+                    kCGImagePropertyAPNGDelayTime: delay,
+                    kCGImagePropertyAPNGUnclampedDelayTime: delay,
+                ],
+            ] as CFDictionary)
+        }
+        guard CGImageDestinationFinalize(destination) else { throw StickerEncodingError.encodeFailed }
+        return data as Data
+    }
+
+    /// Draws each frame scaled to `contentWidth`×`contentHeight` and centred on a transparent canvas.
+    public static func render(_ frames: [CGImage], contentWidth: Int, contentHeight: Int,
+                              canvasWidth: Int, canvasHeight: Int) throws -> [CGImage] {
+        try frames.map { frame in
+            guard let context = ImageOps.makeRGBAContext(width: canvasWidth, height: canvasHeight) else {
+                throw StickerEncodingError.encodeFailed
+            }
+            context.interpolationQuality = .high
+            context.draw(frame, in: CGRect(x: (canvasWidth - contentWidth) / 2, y: (canvasHeight - contentHeight) / 2,
+                                           width: contentWidth, height: contentHeight))
+            guard let image = context.makeImage() else { throw StickerEncodingError.encodeFailed }
+            return image
+        }
     }
 }

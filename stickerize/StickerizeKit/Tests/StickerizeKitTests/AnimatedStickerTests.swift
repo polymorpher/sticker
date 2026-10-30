@@ -68,6 +68,27 @@ final class AnimatedStickerTests: XCTestCase {
         XCTAssertEqual(decoded.duration, 1.2, accuracy: 0.05, "dropped frames' time goes to the kept ones")
     }
 
+    func testResamplingTargetsTheRateAndKeepsTheTiming() {
+        let animation = bouncingSquare(count: 10, delay: 0.1)
+        let eight = animation.resampled(toFramesPerSecond: 8)
+        XCTAssertEqual(eight.frames.count, 8, "10 → 8 fps, not 5 as halving would give")
+        XCTAssertEqual(eight.duration, 1.0, accuracy: 1e-9)
+        XCTAssertLessThanOrEqual(eight.framesPerSecond, 8 + 1e-9)
+        XCTAssertEqual(animation.resampled(toFramesPerSecond: 4).frames.count, 4)
+        XCTAssertEqual(animation.resampled(toFramesPerSecond: 4).duration, 1.0, accuracy: 1e-9)
+        XCTAssertEqual(animation.resampled(toFramesPerSecond: 12).frames.count, 10, "already slower: unchanged")
+    }
+
+    func testResamplingThinsAFastBurstBeforeALongHold() {
+        // 20 frames at 20 fps, then a 2 s hold: 7 fps on average, but the burst still runs at 20.
+        let burst = bouncingSquare(count: 21, delay: 0.05)
+        let animation = AnimatedFrames(frames: burst.frames, delays: Array(repeating: 0.05, count: 20) + [2.0])
+        let thinned = animation.resampled(toFramesPerSecond: 8)
+        XCTAssertEqual(thinned.frames.count, 9)
+        XCTAssertEqual(thinned.duration, 3.0, accuracy: 1e-9)
+        XCTAssertEqual(thinned.delays.last ?? 0, 2.0, accuracy: 1e-9, "the held frame is kept, with its time")
+    }
+
     func testStillImagesHaveOneFrame() {
         XCTAssertEqual(AnimatedImageLoader.frameCount(of: TestImages.encode(TestImages.halves(width: 20, height: 20), type: .png)), 1)
         XCTAssertEqual(AnimatedImageLoader.frameCount(contentsOf: Samples.url("test.jpg")), 1)
