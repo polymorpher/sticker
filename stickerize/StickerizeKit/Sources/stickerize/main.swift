@@ -1,6 +1,6 @@
 // stickerize: lift any subjects out of a photo into a sticker-ready transparent PNG, choosing exactly which
 // instances to keep (Photos' "Add Sticker" only takes its main subject). Same pipeline as the iOS app.
-// Also: `stickerize signal-pack <dir>` converts a folder of stickers (e.g. WeChat exports) into Signal Desktop packs.
+// Also: `stickerize signal-pack <folder or zip>` converts a sticker collection (e.g. WeChat exports) into Signal Desktop packs.
 
 import CoreGraphics
 import Foundation
@@ -10,7 +10,7 @@ import StickerExport
 
 let usage = """
 usage: stickerize <image> [options]
-       stickerize signal-pack <input-dir> --output <dir> [options]
+       stickerize signal-pack <folder-or-zip> --output <dir> [options]
 
 Subject lift (single image):
   --list               list detected instances (id, area %, bbox in image pixels) and exit
@@ -30,13 +30,14 @@ By default the output meets MSSticker's rules: canvas between \(StickerSpec.minP
 Input can be anything ImageIO reads (JPEG, HEIC, PNG, WebP, …) or a PDF (page 1). EXIF orientation is applied.
 Exit status: 0 success, 1 error, 2 usage error, 3 no subject found / background removal unavailable.
 
-Signal pack (folder → Signal Desktop):
-  --output DIR         required; must be outside the input folder, which is never written to
+Signal pack (folder or ZIP → Signal Desktop):
+  --output DIR         required; must be outside the input, which is never written to
   --replace            move the pack-NN folders an earlier run left in DIR to the Trash (otherwise the run stops)
   --max-per-pack N     stickers per pack folder, 1–\(SignalPackExport.stickerCount.upperBound) (default \(SignalPackExport.stickerCount.upperBound))
 
-Converts GIF/JPG/PNG/WebP/APNG (e.g. WeChat favorites from export-wechat-emoji) into Signal stickers, split into
-pack-01, pack-02, … Stills become \(SignalPackExport.pixelDimension) px PNGs (Signal re-encodes them; they're checked to fit its
+Converts GIF/JPG/PNG/WebP/APNG and any other image ImageIO reads (e.g. WeChat favorites from export-wechat-emoji)
+into Signal stickers, split into pack-01, pack-02, … The input is a folder or a ZIP archive; subfolders and ZIP
+archives inside it are searched too, and files without an extension are recognized by their contents. Stills become \(SignalPackExport.pixelDimension) px PNGs (Signal re-encodes them; they're checked to fit its
 \(SignalPackExport.maxFileBytes / 1024) KB limit). Animations become square APNGs of up to \(SignalPackExport.pixelDimension) px and \(SignalPackExport.maxFileBytes / 1024) KB that loop forever, as
 Signal requires; one that is too big is reduced to 256 colors, then shrunk and thinned, and kept as a still if it
 still can't fit. Every reduced sticker is listed.
@@ -60,14 +61,23 @@ struct Options {
 }
 
 struct SignalPackOptions {
-    var inputDirectory = ""
+    var input = ""
     var outputDirectory = ""
     var maxPerPack = SignalPackExport.stickerCount.upperBound
     var replace = false
 }
 
+/// Best effort: a closed terminal or pipe mustn't crash the run (or its cleanup) over a message.
 func log(_ message: String) {
-    FileHandle.standardError.write(Data((message + "\n").utf8))
+    try? FileHandle.standardError.write(contentsOf: Data((message + "\n").utf8))
+}
+
+/// For testing a signal that comes while packs are installed: with STICKERIZE_TEST_HOLD_INSTALL set to a path, the run
+/// creates that file once it can no longer be stopped, and waits (a minute at most) until it is removed.
+func holdBeforeInstallingForTests() {
+    guard let path = ProcessInfo.processInfo.environment["STICKERIZE_TEST_HOLD_INSTALL"] else { return }
+    FileManager.default.createFile(atPath: path, contents: nil)
+    for _ in 0..<600 where FileManager.default.fileExists(atPath: path) { usleep(100_000) }
 }
 
 func parse(_ arguments: [String]) throws -> Options {
@@ -135,12 +145,12 @@ func parseSignalPack(_ arguments: [String]) throws -> SignalPackOptions {
             options.maxPerPack = n
         default:
             if argument.hasPrefix("-") { throw UsageError(message: "unknown option \(argument)") }
-            guard options.inputDirectory.isEmpty else { throw UsageError(message: "only one input directory is supported") }
-            options.inputDirectory = argument
+            guard options.input.isEmpty else { throw UsageError(message: "only one input folder or ZIP archive is supported") }
+            options.input = argument
         }
     }
-    guard !options.inputDirectory.isEmpty else { throw UsageError(message: "missing input directory") }
-    guard !options.outputDirectory.isEmpty else { throw UsageError(message: "--output DIR is required (never writes into the input folder)") }
+    guard !options.input.isEmpty else { throw UsageError(message: "missing input folder or ZIP archive") }
+    guard !options.outputDirectory.isEmpty else { throw UsageError(message: "--output DIR is required (never writes into the input)") }
     // Where the output may go relative to the input is checked by SignalPackExport.writePacks.
     return options
 }
@@ -215,31 +225,55 @@ func run(_ options: Options) throws {
 }
 
 func runSignalPack(_ options: SignalPackOptions) throws {
-    let input = URL(fileURLWithPath: options.inputDirectory, isDirectory: true)
+    let input = URL(fileURLWithPath: options.input)
     let output = URL(fileURLWithPath: options.outputDirectory, isDirectory: true)
     var isDir: ObjCBool = false
-    guard FileManager.default.fileExists(atPath: input.path, isDirectory: &isDir), isDir.boolValue else {
-        throw RunError(errorDescription: "input is not a directory: \(input.path)")
+    guard FileManager.default.fileExists(atPath: input.path, isDirectory: &isDir) else {
+        throw RunError(errorDescription: "input doesn't exist: \(input.path)")
+    }
+    guard isDir.boolValue || ImageFinder.isArchive(input) else {
+        throw RunError(errorDescription: "input must be a folder or a ZIP archive: \(input.path)")
     }
     let report: SignalPackExport.Report
+    // Writing to a closed terminal or pipe fails instead of killing the process before it cleans up.
+    signal(SIGPIPE, SIG_IGN)
+    let signals = stopCleanlyOnSignals()
+    defer { restoreSignals(signals) }
     do {
         report = try SignalPackExport.writePacks(from: input, to: output, maxPerPack: options.maxPerPack,
-                                                 replacingExisting: options.replace, movingReplacedToTrash: true)
+                                                 replacingExisting: options.replace, movingReplacedToTrash: true,
+                                                 willInstall: holdBeforeInstallingForTests)
     } catch let SignalPackError.outputHasPacks(names) {
         throw RunError(errorDescription: "\(output.path) already has \(names.joined(separator: ", ")) from an earlier run. "
             + "Pass --replace to move them to the Trash first, or choose another folder.")
+    } catch let error as SignalPackError {
+        switch error {
+        case let .nothingConverted(skipped), let .tooLargeToUnpack(_, _, _, skipped):
+            for skip in skipped { log("  skipped \(ImageFinder.displayPath(skip.name)): \(skip.reason)") }
+        default: break
+        }
+        throw error
     }
     let stickers = report.packs.flatMap(\.stickers)
-    log("converted \(stickers.count) sticker(s) into \(report.packs.count) pack(s); skipped \(report.skipped.count)")
+    log("converted \(stickers.count) sticker(s) into \(report.packs.count) pack(s); skipped \(report.skipped.count)"
+        + (report.otherFiles > 0 ? "; left out \(report.otherFiles) file(s) that aren't images" : ""))
     for skip in report.skipped {
-        log("  skipped \(skip.name): \(skip.reason)")
+        log("  skipped \(ImageFinder.displayPath(skip.name)): \(skip.reason)")
+    }
+    if report.reachedImageLimit {
+        log("stopped at \(ImageFinder.Limits().maxImages.formatted()) images; convert the rest from a smaller folder or archive")
+    }
+    if report.leftOutAtByteLimit > 0, let first = report.firstLeftOutAtByteLimit {
+        let limit = ByteCountFormatter.string(fromByteCount: Int64(ImageFinder.Limits().maxTotalBytes), countStyle: .memory)
+        log("left out \(report.leftOutAtByteLimit) file(s) from \(ImageFinder.displayPath(first)) on: unpacking them would take more than \(limit), "
+            + "the most one run unpacks; unzip the archive and convert the folder instead")
     }
     let reduced = stickers.filter(\.info.wasReduced)
     if !reduced.isEmpty {
         log("reduced to fit Signal's limits (worth a look before uploading):")
         for sticker in reduced {
             let path = sticker.fileURL.pathComponents.suffix(2).joined(separator: "/")
-            log("  \(path) (from \(sticker.info.sourceName)): \(describeReduction(sticker.info))")
+            log("  \(path) (from \(ImageFinder.displayPath(sticker.info.sourceName))): \(describeReduction(sticker.info))")
         }
     }
     for pack in report.packs {
@@ -252,6 +286,70 @@ func runSignalPack(_ options: SignalPackOptions) throws {
     Assign an emoji per sticker, set title/author, Upload, then Install.
     Docs: https://support.signal.org/hc/en-us/articles/360031836512-Stickers
     """)
+    // A signal that came while the packs were being installed: they are in place and listed above; now stop as asked.
+    if let number = SignalPackExport.takeDeferredSignal() {
+        log("interrupted after the packs were installed")
+        restoreSignals(signals)
+        raiseDefault(number)
+    }
+}
+
+/// Signals handled while a run is in progress, and how each was handled before.
+struct HandledSignals {
+    var sources: [any DispatchSourceSignal] = []
+    var numbers: [Int32] = []
+}
+
+/// Ctrl-C, a kill or a closed terminal would skip the run's cleanup and leave up to 2 GB of unpacked images behind.
+/// Instead the run is asked to stop: it does so at its next file (or chunk, while unpacking) and removes its temporary
+/// files. Meanwhile a second Ctrl-C or kill ends the process at once; another hangup doesn't, as closing a terminal
+/// running zsh sends two. Then the process dies of the signal, so a shell script running it stops too. If the run was
+/// already installing its packs, it finishes and reports first.
+/// Signals the process inherited as ignored (`nohup`, background jobs of a script) stay ignored.
+func stopCleanlyOnSignals() -> HandledSignals {
+    var handled = HandledSignals()
+    handled.numbers = [SIGINT, SIGTERM, SIGHUP].filter { !isIgnore(signal($0, SIG_IGN)) }
+    let numbers = handled.numbers
+    // One queue for all of them: once one is stopping the run, the others wait (a second Ctrl-C or kill meanwhile goes
+    // to the system's default handler, which quits at once).
+    let queue = DispatchQueue(label: "signals")
+    handled.sources = numbers.map { number in
+        let source = DispatchSource.makeSignalSource(signal: number, queue: queue)
+        source.setEventHandler {
+            if SignalPackExport.cancelRuns(deferring: number) {
+                return // installing: the run finishes, prints its report, then stops (see runSignalPack)
+            }
+            // What quits at once now: the same again, except a hangup (a closed terminal sends two).
+            let ctrlC = "; press Ctrl-C again to quit at once", kill = "; kill it again to quit at once"
+            let hint = number == SIGINT ? ctrlC : number == SIGTERM ? kill
+                : numbers.contains(SIGINT) ? ctrlC : numbers.contains(SIGTERM) ? kill : ""
+            log("stopping and removing temporary files" + hint)
+            for other in numbers where other != SIGHUP { signal(other, SIG_DFL) }
+            SignalPackExport.waitForRuns()
+            raiseDefault(number)
+        }
+        source.resume()
+        return source
+    }
+    return handled
+}
+
+func restoreSignals(_ handled: HandledSignals) {
+    for source in handled.sources { source.cancel() }
+    for number in handled.numbers { signal(number, SIG_DFL) }
+}
+
+func isIgnore(_ handler: sig_t?) -> Bool {
+    unsafeBitCast(handler, to: Int.self) == unsafeBitCast(SIG_IGN, to: Int.self)
+}
+
+/// Dies of `number`, as if it had never been handled, after writing out what was printed.
+func raiseDefault(_ number: Int32) -> Never {
+    fflush(stdout)
+    signal(number, SIG_DFL)
+    kill(getpid(), number)
+    sleep(1)
+    _exit(128 + number)
 }
 
 func describeReduction(_ info: SignalPackExport.StickerInfo) -> String {
@@ -272,6 +370,9 @@ do {
     } else {
         try run(try parse(args))
     }
+} catch is CancellationError {
+    // Stopped by a signal: its handler ends the process once the run has cleaned up.
+    while true { pause() }
 } catch let error as UsageError {
     log("error: \(error.message)\n\n\(usage)")
     exit(2)

@@ -64,12 +64,6 @@ final class StickerStoreTests: XCTestCase {
         XCTAssertEqual(stickers[0].format, .png, "manifests from before animated stickers are all PNG")
     }
 
-    func testUncoordinatedReadMatchesCoordinated() throws {
-        _ = try store.add(try sample(), name: "A")
-        _ = try store.add(try sample(), name: "B")
-        XCTAssertEqual(try store.stickers(coordinated: false), try store.stickers())
-    }
-
     func testPasteboardCopyIsAtMost512Pixels() throws {
         let big = try store.add(try StickerEncoder.encode(TestImages.halves(width: 1200, height: 600)), name: "Big")
         XCTAssertEqual(big.pixelWidth, 618)
@@ -116,13 +110,30 @@ final class StickerStoreTests: XCTestCase {
         let recovered = try store.stickers()
         XCTAssertEqual(Set(recovered.map(\.id)), [a.id, b.id])
         XCTAssertEqual(recovered.first { $0.id == b.id }?.pixelWidth, 60)
-        let backups = try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix("manifest.corrupt-") }
-        XCTAssertEqual(backups.count, 1)
-        // Reading again (manifest now missing) still finds the files.
+        // Readers (the iMessage and keyboard extensions) rebuild in memory only and leave the file alone.
+        func backups() throws -> [String] {
+            try FileManager.default.contentsOfDirectory(atPath: directory.path).filter { $0.hasPrefix("manifest.corrupt-") }
+        }
+        XCTAssertEqual(try backups().count, 0)
         XCTAssertEqual(Set(try store.stickers().map(\.id)), [a.id, b.id])
-        // The rebuilt manifest is persisted on the next write.
+        // The next write sets the bad file aside and persists the rebuilt library.
         try store.rename(a.id, to: "A again")
+        XCTAssertEqual(try backups().count, 1)
         XCTAssertEqual(try store.stickers().first { $0.id == a.id }?.name, "A again")
+    }
+
+    func testUnreadableManifestIsNeverOverwritten() throws {
+        let a = try store.add(try sample(), name: "A")
+        let url = directory.appendingPathComponent("manifest.json")
+        let before = try Data(contentsOf: url)
+        // A manifest that exists but can't be read right now (here: a directory in its place stands in for a
+        // protection or permission error) must make writes fail, not replace it with a library rebuilt from files.
+        try FileManager.default.removeItem(at: url)
+        try FileManager.default.createDirectory(at: url, withIntermediateDirectories: false)
+        XCTAssertThrowsError(try store.rename(a.id, to: "Renamed"))
+        try FileManager.default.removeItem(at: url)
+        try before.write(to: url)
+        XCTAssertEqual(try store.stickers().map(\.name), ["A"])
     }
 
     func testConcurrentWritersDontLoseUpdates() throws {

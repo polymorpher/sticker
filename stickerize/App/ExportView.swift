@@ -9,12 +9,22 @@ struct ExportView: View {
     let onExported: () -> Void
 
     @Environment(LibraryModel.self) private var library
-    @State private var packName = String(localized: "My Stickers")
+    @State private var packName: String
     @State private var publisher = String(localized: "Made with Stickerize")
     @State private var exportTask: Task<Void, Never>?
     @State private var errorMessage: String?
 
     private var isExporting: Bool { exportTask != nil }
+
+    /// `suggestedPackName`: the WhatsApp pack's starting name (the folder the stickers are in).
+    init(messenger: StickerActions.Messenger, stickers: [Sticker], suggestedPackName: String? = nil,
+         onCancel: @escaping () -> Void, onExported: @escaping () -> Void) {
+        self.messenger = messenger
+        self.stickers = stickers
+        self.onCancel = onCancel
+        self.onExported = onExported
+        _packName = State(initialValue: suggestedPackName ?? String(localized: "My Stickers"))
+    }
 
     var body: some View {
         NavigationStack {

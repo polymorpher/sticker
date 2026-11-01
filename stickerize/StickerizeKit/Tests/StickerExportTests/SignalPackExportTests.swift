@@ -3,6 +3,7 @@ import Foundation
 import ImageIO
 @testable import StickerExport
 import StickerizeKit
+import StickerizeTestSupport
 import XCTest
 
 /// Signal's sticker creator (Signal-Desktop sticker-creator/src/util/processImage.ts) rejects an APNG unless it is
@@ -281,7 +282,8 @@ final class SignalPackExportTests: XCTestCase {
         let broken = try folder("broken")
         try Data("not an image".utf8).write(to: broken.appendingPathComponent("bad.png"))
         XCTAssertThrowsError(try SignalPackExport.writePacks(from: broken, to: output, replacingExisting: true)) { error in
-            XCTAssertEqual(error as? SignalPackError, .nothingConverted(skipped: 1))
+            guard case let .nothingConverted(skipped) = error as? SignalPackError else { return XCTFail("\(error)") }
+            XCTAssertEqual(skipped.map(\.name), ["bad.png"])
         }
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.appendingPathComponent("pack-01").path), ["001-a.png"])
         XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: output.path), ["pack-01"])
@@ -380,13 +382,218 @@ final class SignalPackExportTests: XCTestCase {
         XCTAssertEqual(try SignalPackExport.writePacks(from: sibling, to: output).packs.count, 1)
     }
 
-    func testListImagesIncludesAPNGSkipsFoldersAndSortsNaturally() throws {
-        let input = try folder("in")
-        for name in ["b.png", "a.PNG", "10.gif", "9.gif", "x.apng", "notes.txt"] {
-            try Data().write(to: input.appendingPathComponent(name))
+    /// export-wechat-emoji's default layout: folders of 50, files named by MD5 or number (some without an extension),
+    /// and an info folder of text files.
+    func testFindsStickersInSubfoldersLikeAWeChatExport() throws {
+        let input = try folder("微信表情包_导出_20261030_120000")
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 1))
+        let gif = try AnimatedStickerEncoder.gifData(frames: movingSquare(width: 80, height: 80, frames: 4),
+                                                     delays: Array(repeating: 0.1, count: 4), loopCount: 0)
+        try FileManager.default.createDirectory(at: input.appendingPathComponent("51_100_组"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: input.appendingPathComponent("1_50_组"), withIntermediateDirectories: true)
+        try FileManager.default.createDirectory(at: input.appendingPathComponent("导出信息"), withIntermediateDirectories: true)
+        try png.write(to: input.appendingPathComponent("1_50_组/3f2a9c0d8e7b6a5f4e3d2c1b0a9f8e7d.png"))
+        try gif.write(to: input.appendingPathComponent("1_50_组/开心.gif"))
+        try png.write(to: input.appendingPathComponent("51_100_组/000051")) // no extension
+        try png.write(to: input.appendingPathComponent("51_100_组/.hidden.png"))
+        try Data("https://…".utf8).write(to: input.appendingPathComponent("导出信息/emoticon_urls.txt"))
+
+        let report = try SignalPackExport.writePacks(from: input, to: root.appendingPathComponent("out"))
+        XCTAssertEqual(report.packs.flatMap(\.stickers).map(\.fileURL.lastPathComponent),
+                       ["001-3f2a9c0d8e7b6a5f4e3d2c1b0a9f8e7d.png", "002-开心.apng", "003-000051.png"])
+        XCTAssertEqual(report.skipped, [])
+        XCTAssertEqual(report.otherFiles, 1)
+    }
+
+    /// The same collection zipped on Chinese Windows: GBK names without a UTF-8 flag, plus a ZIP archive inside.
+    func testWritesPacksFromAZipArchiveWithLegacyNamesAndNestedArchives() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 2))
+        let inner = try TestZip([TestZip.Entry(rawName: TestZip.bytes("狗头.png", .GB_18030_2000), png)]).data()
+        var encrypted = TestZip.Entry("locked.png", png)
+        encrypted.flags = 0x0001
+        let zip = TestZip([
+            TestZip.Entry(rawName: TestZip.bytes("表情包/1_50_组/开心.png", .GB_18030_2000), png),
+            TestZip.Entry(rawName: TestZip.bytes("表情包/更多.zip", .GB_18030_2000), inner, deflate: false),
+            TestZip.Entry(rawName: TestZip.bytes("表情包/说明.txt", .GB_18030_2000), Data("hi".utf8)),
+            encrypted,
+        ])
+        let archive = try zip.write(to: root.appendingPathComponent("stickers.zip"))
+        let before = try Data(contentsOf: archive)
+        let report = try SignalPackExport.writePacks(from: archive, to: root.appendingPathComponent("out"))
+        XCTAssertEqual(report.packs.flatMap(\.stickers).map(\.fileURL.lastPathComponent), ["001-开心.png", "002-狗头.png"])
+        XCTAssertEqual(report.packs.flatMap(\.stickers).map(\.info.sourceName), ["开心", "狗头"])
+        XCTAssertEqual(report.skipped.map(\.name), ["locked.png"])
+        XCTAssertEqual(report.otherFiles, 1)
+        XCTAssertEqual(try Data(contentsOf: archive), before, "the archive is only read")
+    }
+
+    /// Password-protected sticker ZIPs are common; saying "no images found" would send the user looking elsewhere.
+    func testPasswordProtectedArchiveSaysSoAndListsTheFiles() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 3))
+        var first = TestZip.Entry("a.png", png)
+        first.flags = 0x0001
+        var second = TestZip.Entry("dir/sub/b.png", png)
+        second.flags = 0x0001
+        let archive = try TestZip([first, second]).write(to: root.appendingPathComponent("locked.zip"))
+        XCTAssertThrowsError(try SignalPackExport.writePacks(from: archive, to: root.appendingPathComponent("out"))) { error in
+            guard case let .nothingConverted(skipped) = error as? SignalPackError else { return XCTFail("\(error)") }
+            XCTAssertEqual(skipped.map(\.name), ["a.png", "dir/sub/b.png"], "named by their path in the input")
+            XCTAssertTrue((error as? LocalizedError)?.errorDescription?.contains("password-protected") == true)
         }
-        try FileManager.default.createDirectory(at: input.appendingPathComponent("folder.gif"), withIntermediateDirectories: false)
-        XCTAssertEqual(try SignalPackExport.listImages(in: input).map(\.lastPathComponent), ["9.gif", "10.gif", "a.PNG", "b.png", "x.apng"])
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("out").path), [],
+                       "nothing written, nothing left unpacked")
+    }
+
+    /// Staging (with the images unpacked from archives) lives in the system's temporary items, outside the output: it
+    /// must be gone after a run, whether it succeeds, converts nothing or is cancelled.
+    func testRunsLeaveNoStagingBehind() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 4))
+        let zip = try TestZip([TestZip.Entry("dir/sub/good.png", png), TestZip.Entry("dir/sub/bad.png", Data("no".utf8))])
+            .write(to: root.appendingPathComponent("in.zip"))
+        var stagings: [URL] = []
+        let report = try run(zip, to: root.appendingPathComponent("out")) { stagings.append($0) }
+        XCTAssertEqual(report.skipped.map(\.name), ["dir/sub/bad.png"], "named by their path in the input")
+        let broken = try TestZip([TestZip.Entry("bad.png", Data("no".utf8))]).write(to: root.appendingPathComponent("bad.zip"))
+        XCTAssertThrowsError(try run(broken, to: root.appendingPathComponent("out2")) { stagings.append($0) })
+        // Cancelled as soon as it has a staging folder: it stops at its first check.
+        let state = SignalPackExport.RunState()
+        XCTAssertThrowsError(try run(zip, to: root.appendingPathComponent("out3"), state: state) {
+            stagings.append($0)
+            XCTAssertFalse(state.cancel())
+        }) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("out3").path), [])
+        XCTAssertEqual(stagings.count, 3)
+        for staging in stagings { XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path), staging.path) }
+    }
+
+    /// A run killed outright (or crashed) can't clean up; the next run removes what it left, and only that.
+    func testStagingLeftByAKilledRunIsRemovedByTheNext() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 6))
+        let zip = try TestZip([TestZip.Entry("a.png", png)]).write(to: root.appendingPathComponent("in.zip"))
+        var parent: URL!
+        try run(zip, to: root.appendingPathComponent("out")) { parent = $0.deletingLastPathComponent() }
+        // A process that has ended, and this one.
+        let ended = Process()
+        ended.executableURL = URL(fileURLWithPath: "/usr/bin/true")
+        try ended.run()
+        ended.waitUntilExit()
+        let stale = parent.appendingPathComponent("stale-\(UUID().uuidString)", isDirectory: true)
+        let alive = parent.appendingPathComponent("alive-\(UUID().uuidString)", isDirectory: true)
+        let unmarked = parent.appendingPathComponent("other-\(UUID().uuidString)", isDirectory: true)
+        for (folder, pid) in [(stale, ended.processIdentifier), (alive, getpid()), (unmarked, nil)] {
+            try FileManager.default.createDirectory(at: folder.appendingPathComponent("unpacked"), withIntermediateDirectories: true)
+            if let pid { try Data(String(pid).utf8).write(to: folder.appendingPathComponent(".signal-pack-run")) }
+        }
+        defer { for folder in [stale, alive, unmarked] { try? FileManager.default.removeItem(at: folder) } }
+        try run(zip, to: root.appendingPathComponent("out2"))
+        XCTAssertFalse(FileManager.default.fileExists(atPath: stale.path), "left by a process that is gone")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: alive.path), "a run still going")
+        XCTAssertTrue(FileManager.default.fileExists(atPath: unmarked.path), "not this tool's")
+    }
+
+    /// A cancel while converting stops the real run at its next image and removes its staging; one after the point of no
+    /// return lets it install and report, keeping the signal for afterwards.
+    func testCancellingARealRun() throws {
+        let png = try StickerEncoder.pngData(noise(side: 24, seed: 8))
+        let input = try folder("many")
+        for index in 0..<200 { try png.write(to: input.appendingPathComponent(String(format: "%03d.png", index))) }
+        let state = SignalPackExport.RunState()
+        var staging: URL?
+        XCTAssertThrowsError(try run(input, to: root.appendingPathComponent("out"), state: state, staging: { url in
+            staging = url
+            // Cancel from another thread once the first pack folder exists, as a signal handler would.
+            DispatchQueue.global().async {
+                while !FileManager.default.fileExists(atPath: url.appendingPathComponent("pack-01").path) { usleep(1000) }
+                XCTAssertFalse(state.cancel(deferring: SIGINT))
+            }
+        })) { XCTAssertTrue($0 is CancellationError, "\($0)") }
+        state.waitUntilIdle()
+        XCTAssertFalse(FileManager.default.fileExists(atPath: try XCTUnwrap(staging).path))
+        XCTAssertEqual(try FileManager.default.contentsOfDirectory(atPath: root.appendingPathComponent("out").path), [])
+
+        let installing = SignalPackExport.RunState()
+        let few = try folder("few")
+        for index in 0..<3 { try png.write(to: few.appendingPathComponent("\(index).png")) }
+        let report = try SignalPackExport.writePacks(
+            from: few, to: root.appendingPathComponent("out2"), maxPerPack: 200, replacingExisting: false,
+            movingReplacedToTrash: false, limits: ImageFinder.Limits(), runState: installing,
+            committed: { XCTAssertTrue(installing.cancel(deferring: SIGTERM)) })
+        XCTAssertEqual(report.packs.flatMap(\.stickers).count, 3)
+        XCTAssertEqual(installing.takeDeferredSignal(), SIGTERM)
+    }
+
+    /// Nothing could be unpacked within the run's limit (a large archive inside took it all).
+    func testNothingUnpackedWithinTheLimitSaysSo() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 7))
+        let inner = TestZip([TestZip.Entry("a.png", png), TestZip.Entry("b.png", png)]).data()
+        let zip = try TestZip([TestZip.Entry("inner.zip", inner, deflate: false)]).write(to: root.appendingPathComponent("in.zip"))
+        var limits = ImageFinder.Limits()
+        limits.maxTotalBytes = UInt64(max(inner.count, 4096))
+        XCTAssertThrowsError(try SignalPackExport.writePacks(from: zip, to: root.appendingPathComponent("out"), limits: limits)) {
+            XCTAssertEqual($0 as? SignalPackError, .tooLargeToUnpack(limit: limits.maxTotalBytes, leftOut: 2, firstLeftOut: "inner.zip/a.png",
+                                                                      skipped: []))
+        }
+        // Images unpacked within the limit that don't convert: the ones left out are still told.
+        let junk = try TestZip([TestZip.Entry("a.png", Data(repeating: 9, count: 100)), TestZip.Entry("b.png", png)])
+            .write(to: root.appendingPathComponent("junk.zip"))
+        limits.maxTotalBytes = 4096
+        XCTAssertThrowsError(try SignalPackExport.writePacks(from: junk, to: root.appendingPathComponent("out2"), limits: limits)) {
+            guard case let .tooLargeToUnpack(_, leftOut, firstLeftOut, skipped) = $0 as? SignalPackError else { return XCTFail("\($0)") }
+            XCTAssertEqual(leftOut, 1)
+            XCTAssertEqual(firstLeftOut, "b.png")
+            XCTAssertEqual(skipped.map(\.name), ["a.png"])
+        }
+    }
+
+    func testTheImageLimitIsReported() throws {
+        let png = try StickerEncoder.pngData(noise(side: 64, seed: 5))
+        let zip = try TestZip((1...3).map { TestZip.Entry("\($0).png", png) }).write(to: root.appendingPathComponent("three.zip"))
+        var limits = ImageFinder.Limits()
+        limits.maxImages = 2
+        let report = try SignalPackExport.writePacks(from: zip, to: root.appendingPathComponent("out"), limits: limits)
+        XCTAssertTrue(report.reachedImageLimit)
+        XCTAssertEqual(report.packs.flatMap(\.stickers).map(\.info.sourceName), ["1", "2"])
+    }
+
+    /// What a signal handler relies on: a cancel makes a run stop at its next check, and waiting returns once the run
+    /// has ended (its cleanup done).
+    func testCancellingARunWaitsForItToEnd() throws {
+        let state = SignalPackExport.RunState()
+        try state.begin()
+        let ended = expectation(description: "run ended")
+        DispatchQueue.global().async {
+            while (try? state.checkCancelled()) != nil { usleep(1000) }
+            usleep(50_000) // cleaning up
+            state.end()
+            ended.fulfill()
+        }
+        let started = Date()
+        XCTAssertFalse(state.cancel(deferring: SIGINT), "not installing")
+        state.waitUntilIdle()
+        XCTAssertGreaterThanOrEqual(Date().timeIntervalSince(started), 0.05, "waited for the cleanup")
+        wait(for: [ended], timeout: 1)
+        XCTAssertNil(state.takeDeferredSignal())
+        XCTAssertThrowsError(try state.begin(), "no new run after a cancel") { XCTAssertTrue($0 is CancellationError) }
+        // Nothing running: returns at once.
+        SignalPackExport.RunState().waitUntilIdle()
+    }
+
+    /// Past the point of no return a run finishes: the cancel says so and keeps the signal for after the report.
+    func testACancelWhileInstallingLetsTheRunFinish() throws {
+        let state = SignalPackExport.RunState()
+        try state.begin()
+        try state.commit()
+        XCTAssertTrue(state.cancel(deferring: SIGTERM))
+        XCTAssertTrue(state.cancel(deferring: SIGINT), "the first signal is the one kept")
+        state.end()
+        state.waitUntilIdle()
+        XCTAssertEqual(state.takeDeferredSignal(), SIGTERM)
+        XCTAssertNil(state.takeDeferredSignal(), "once")
+        // A run cancelled before it commits stops instead.
+        let other = SignalPackExport.RunState()
+        try other.begin()
+        XCTAssertFalse(other.cancel())
+        XCTAssertThrowsError(try other.commit()) { XCTAssertTrue($0 is CancellationError) }
     }
 
     // MARK: Fixtures
@@ -408,6 +615,15 @@ final class SignalPackExportTests: XCTestCase {
         try AnimatedStickerEncoder.gifData(frames: frames, delays: Array(repeating: delay, count: frames.count),
                                            loopCount: loopCount).write(to: url)
         return url
+    }
+
+    /// `writePacks` with a run state of its own, telling `staging` where it builds the packs.
+    @discardableResult
+    private func run(_ input: URL, to output: URL, state: SignalPackExport.RunState = .init(),
+                     staging: (URL) -> Void = { _ in }) throws -> SignalPackExport.Report {
+        try SignalPackExport.writePacks(from: input, to: output, maxPerPack: SignalPackExport.stickerCount.upperBound,
+                                        replacingExisting: false, movingReplacedToTrash: false, limits: ImageFinder.Limits(),
+                                        runState: state, stagingCreated: staging)
     }
 
     private func snapshot(_ directory: URL) throws -> [String: Data] {

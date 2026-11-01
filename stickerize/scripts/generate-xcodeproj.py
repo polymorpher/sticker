@@ -61,7 +61,7 @@ targets = [
              "SWIFT_EMIT_LOC_STRINGS": "YES",
          }),
     dict(key="msg", name="StickerizeMessages", product="StickerizeMessages.appex", ftype="wrapper.app-extension",
-         ptype="com.apple.product-type.app-extension.messages", groups=["MessagesExtension"],
+         ptype="com.apple.product-type.app-extension.messages", groups=["MessagesExtension", "ExtensionUI"],
          packages=["StickerizeKit"],
          settings={
              "APPLICATION_EXTENSION_API_ONLY": "YES",
@@ -78,7 +78,7 @@ targets = [
              "SWIFT_EMIT_LOC_STRINGS": "YES",
          }),
     dict(key="kb", name="StickerizeKeyboard", product="StickerizeKeyboard.appex", ftype="wrapper.app-extension",
-         ptype="com.apple.product-type.app-extension", groups=["KeyboardExtension"],
+         ptype="com.apple.product-type.app-extension", groups=["KeyboardExtension", "ExtensionUI"],
          packages=["StickerizeKit"],
          settings={
              "APPLICATION_EXTENSION_API_ONLY": "YES",
@@ -168,7 +168,7 @@ MAIN = oid("group.main")
 PRODUCTS = oid("group.products")
 CONFIG = oid("group.config")
 FRAMEWORKS_GROUP = None
-sync_groups = ["App", "Shared", "MessagesExtension", "KeyboardExtension", "ShareExtension", "StickerizeUITests"]
+sync_groups = ["App", "Shared", "ExtensionUI", "MessagesExtension", "KeyboardExtension", "ShareExtension", "StickerizeUITests"]
 EMBED = oid("phase.embed")
 
 o = []

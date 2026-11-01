@@ -6,19 +6,30 @@ import SwiftUI
 struct StickerEditorFlow: View {
     let items: [ImportedImage]
     let store: StickerStore
+    /// The folder the batch goes into (nil for the top level), and its path's names, to show where each sticker goes.
+    var destination: UUID?
+    var destinationPath: [String] = []
     /// Called with the number of stickers saved once the batch is finished or cancelled.
     let onFinish: (Int) -> Void
 
     @State private var index = 0
     @State private var saved = 0
     @State private var finished = false
+    /// The batch's last saved sticker: each one goes right after it, so the batch keeps its own order.
+    @State private var lastSaved: Sticker.ID?
 
     var body: some View {
         NavigationStack {
             if items.indices.contains(index) {
                 let item = items[index]
                 StickerEditorView(item: item, store: store, position: (index + 1, items.count),
-                                  onSaved: { saved += 1; advance(from: item.id) },
+                                  target: .init(folder: destination, path: item.folderPath, after: lastSaved),
+                                  shownPath: destinationPath + item.folderPath,
+                                  onSaved: { sticker in
+                                      saved += 1
+                                      lastSaved = sticker.id
+                                      advance(from: item.id)
+                                  },
                                   onSkip: { advance(from: item.id) },
                                   onCancel: finish)
                     .id(item.id)
@@ -40,9 +51,19 @@ struct StickerEditorFlow: View {
 }
 
 struct StickerEditorView: View {
+    /// Where a saved sticker goes (see `StickerStore.add`).
+    struct Target {
+        var folder: UUID?
+        var path: [String] = []
+        var after: UUID?
+    }
+
     let store: StickerStore
     let position: (Int, Int)
-    let onSaved: () -> Void
+    let target: Target
+    /// The folder names it will be saved in, from the top level; empty for the top level.
+    let shownPath: [String]
+    let onSaved: (Sticker) -> Void
     let onSkip: () -> Void
     let onCancel: () -> Void
 
@@ -52,10 +73,12 @@ struct StickerEditorView: View {
 
     private enum Field { case name, emoji }
 
-    init(item: ImportedImage, store: StickerStore, position: (Int, Int),
-         onSaved: @escaping () -> Void, onSkip: @escaping () -> Void, onCancel: @escaping () -> Void) {
+    init(item: ImportedImage, store: StickerStore, position: (Int, Int), target: Target = Target(), shownPath: [String] = [],
+         onSaved: @escaping (Sticker) -> Void, onSkip: @escaping () -> Void, onCancel: @escaping () -> Void) {
         self.store = store
         self.position = position
+        self.target = target
+        self.shownPath = shownPath
         self.onSaved = onSaved
         self.onSkip = onSkip
         self.onCancel = onCancel
@@ -133,6 +156,12 @@ struct StickerEditorView: View {
                         let emoji = String(newValue.filter(\.isEmojiCharacter).prefix(3))
                         if emoji != newValue { model.emoji = emoji }
                     }
+                if !shownPath.isEmpty {
+                    LabeledContent("Folder") {
+                        Text(shownPath.joined(separator: " › "))
+                            .accessibilityLabel(Text(shownPath.reversed().joined(separator: String(localized: ", in "))))
+                    }
+                }
             } footer: {
                 Text("The name is what VoiceOver reads for the sticker.")
             }
@@ -153,7 +182,7 @@ struct StickerEditorView: View {
             ToolbarItem(placement: .confirmationAction) {
                 Button("Save") {
                     Task {
-                        if await model.save(to: store) { onSaved() }
+                        if let sticker = await save() { onSaved(sticker) }
                     }
                 }
                 .disabled(!model.canSave)
@@ -163,7 +192,7 @@ struct StickerEditorView: View {
         .task {
             await model.prepare()
             #if DEBUG
-            if DebugLaunch.autoSave, await model.save(to: store) { onSaved() }
+            if DebugLaunch.autoSave, let sticker = await save() { onSaved(sticker) }
             #endif
         }
         .alert("Couldn't Make the Sticker", isPresented: Binding(get: { model.errorMessage != nil },
@@ -173,6 +202,10 @@ struct StickerEditorView: View {
             Text(model.errorMessage ?? "")
         }
         .interactiveDismissDisabled()
+    }
+
+    private func save() async -> Sticker? {
+        await model.save(to: store, in: target.folder, path: target.path, after: target.after)
     }
 
     @ViewBuilder

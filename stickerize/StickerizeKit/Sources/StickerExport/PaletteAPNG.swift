@@ -292,19 +292,9 @@ enum PNGChunks {
         return chunk
     }
 
-    /// CRC-32 (ISO 3309), as the PNG spec computes it over a chunk's type and data.
+    /// CRC-32 as the PNG spec computes it over a chunk's type and data.
     static func crc32(_ bytes: [UInt8]) -> UInt32 {
-        var crc: UInt32 = 0xFFFF_FFFF
-        for byte in bytes {
-            crc = crcTable[Int((crc ^ UInt32(byte)) & 0xFF)] ^ (crc >> 8)
-        }
-        return crc ^ 0xFFFF_FFFF
-    }
-
-    private static let crcTable: [UInt32] = (0..<256).map { value in
-        var crc = UInt32(value)
-        for _ in 0..<8 { crc = crc & 1 == 1 ? 0xEDB8_8320 ^ (crc >> 1) : crc >> 1 }
-        return crc
+        CRC32.checksum(bytes)
     }
 }
 

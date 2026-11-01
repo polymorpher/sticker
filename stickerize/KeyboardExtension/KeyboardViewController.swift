@@ -7,9 +7,19 @@ import UniformTypeIdentifiers
 /// A sticker picker, not a typing keyboard: keyboards can only insert text (UITextDocumentProxy has no image API), so
 /// tapping a sticker copies its PNG and the user pastes it. Copying needs Full Access; without it the keyboard still
 /// shows the stickers (the App Group is readable) and explains how to turn it on.
+/// A header picks a folder to show. With no way to type into its own search field, it searches by the word just typed
+/// in the app's text field instead: the stickers matching it are shown, with a button to show everything again.
 /// Memory is tight in keyboards (tens of MB), so it only decodes cell-sized thumbnails and never links Vision.
 final class KeyboardViewController: UIInputViewController {
     private let store = StickerStore.makeDefault()
+    private var library = StickerLibrary()
+    /// The folder shown (nil for all stickers).
+    private var scope: UUID?
+    /// Stickers matching the word before the cursor, while that's what is shown.
+    private var match: (word: String, stickers: [Sticker])?
+    /// The typed word whose matches the user dismissed; it isn't matched again until a different word is typed.
+    private var dismissedWord: String?
+    /// What the grid shows.
     private var stickers: [Sticker] = []
     private var observer: StickerChangeObserver?
     private let thumbnails = NSCache<NSUUID, UIImage>()
@@ -21,6 +31,10 @@ final class KeyboardViewController: UIInputViewController {
     private let bannerLabel = PaddedLabel()
     private let toastLabel = PaddedLabel()
     private let globeButton = UIButton(type: .system)
+    private let header = UIStackView()
+    private let scopeButton = FolderScopeButton()
+    private let matchButton = UIButton(type: .system)
+    private let scopeList = FolderScopeList()
     private var toastHideWork: DispatchWorkItem?
     private var heightConstraint: NSLayoutConstraint?
 
@@ -49,10 +63,16 @@ final class KeyboardViewController: UIInputViewController {
         reload()
     }
 
+    override func textDidChange(_ textInput: UITextInput?) {
+        super.textDidChange(textInput)
+        showStickers()
+    }
+
     override func viewWillLayoutSubviews() {
         // On Face ID iPhones the system draws its own globe key below the keyboard; elsewhere we must offer one.
         globeButton.isHidden = !needsInputModeSwitchKey
         collectionView.contentInset.bottom = needsInputModeSwitchKey ? 52 : 0
+        scopeList.bottomInset = needsInputModeSwitchKey ? 52 : 0
         heightConstraint?.constant = preferredHeight
         super.viewWillLayoutSubviews()
     }
@@ -80,14 +100,58 @@ final class KeyboardViewController: UIInputViewController {
     // MARK: Stickers
 
     private func reload() {
-        // Read files directly: without Full Access the App Group is read-only and coordination isn't needed.
-        stickers = (try? store.stickers(coordinated: false)) ?? []
-        collectionView.reloadData()
+        // A plain read: without Full Access the App Group is read-only, and readers never write.
+        library = (try? store.library()) ?? StickerLibrary()
+        if let scope, library.folder(scope) == nil { self.scope = nil }
+        if !scopeList.isHidden { scopeList.show(library, current: scope) }
+        // Every cell again, not just when the stickers change: Full Access (cell opacity) or a name may have.
+        showStickers(reloadingCells: true)
+    }
+
+    /// Fills the grid: the stickers matching the word just typed, if any, otherwise the folder shown.
+    private func showStickers(reloadingCells: Bool = false) {
+        let word = StickerLibrary.typedWord(in: textDocumentProxy.documentContextBeforeInput)
+        if word != dismissedWord { dismissedWord = nil }
+        let previous = stickers.map(\.id)
+        match = word != nil && word == dismissedWord ? nil
+            : library.suggestions(forTextBefore: textDocumentProxy.documentContextBeforeInput, in: scope)
+        stickers = match?.stickers ?? library.stickers(inTree: scope)
+        if reloadingCells || stickers.map(\.id) != previous { collectionView.reloadData() }
+
+        scopeButton.update(path: library.path(to: scope).map(\.name), isOpen: !scopeList.isHidden)
+        if let match {
+            var configuration = matchButton.configuration
+            configuration?.title = String(localized: "“\(match.word)”")
+            matchButton.configuration = configuration
+            matchButton.accessibilityLabel = String(localized: "Showing stickers matching \(match.word)")
+            matchButton.accessibilityHint = scope == nil
+                ? String(localized: "Shows all stickers again") : String(localized: "Shows this folder's stickers again")
+        }
+        matchButton.isHidden = match == nil
+        header.isHidden = library.isEmpty
         messageLabel.text = store.location == .local
             ? String(localized: "Stickerize can't reach its shared library. Open the app for details.")
+            : scope != nil && !library.stickers.isEmpty ? String(localized: "No stickers in this folder yet.")
             : String(localized: "No stickers yet. Open the Stickerize app to make some.")
         messageLabel.isHidden = !stickers.isEmpty
-        bannerLabel.isHidden = stickers.isEmpty || hasFullAccess
+        bannerLabel.isHidden = library.stickers.isEmpty || hasFullAccess
+    }
+
+    private func pick(_ folder: UUID?) {
+        scope = folder
+        setScopeListHidden(true)
+        showStickers()
+        collectionView.setContentOffset(CGPoint(x: 0, y: -collectionView.adjustedContentInset.top), animated: false)
+    }
+
+    private func setScopeListHidden(_ hidden: Bool) {
+        let changed = scopeList.isHidden != hidden
+        if !hidden { scopeList.show(library, current: scope) }
+        scopeList.isHidden = hidden
+        // VoiceOver would otherwise still reach the stickers under the list.
+        for covered in [collectionView, bannerLabel, messageLabel] as [UIView] { covered.accessibilityElementsHidden = !hidden }
+        scopeButton.update(path: library.path(to: scope).map(\.name), isOpen: !hidden)
+        if changed { UIAccessibility.post(notification: .layoutChanged, argument: hidden ? collectionView : scopeList) }
     }
 
     private func copy(_ sticker: Sticker) {
@@ -154,14 +218,53 @@ final class KeyboardViewController: UIInputViewController {
         globeButton.addTarget(self, action: #selector(handleInputModeList(from:with:)), for: .allTouchEvents)
         globeButton.isHidden = true
 
-        // The banner sits above the grid (a hidden arranged view takes no space).
-        let column = UIStackView(arrangedSubviews: [bannerLabel, collectionView])
+        scopeButton.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            setScopeListHidden(!scopeList.isHidden)
+        }, for: .primaryActionTriggered)
+        var chip = UIButton.Configuration.tinted()
+        chip.image = UIImage(systemName: "xmark.circle.fill", withConfiguration: UIImage.SymbolConfiguration(textStyle: .caption1))
+        chip.imagePlacement = .trailing
+        chip.imagePadding = 4
+        chip.cornerStyle = .capsule
+        chip.titleLineBreakMode = .byTruncatingTail
+        chip.contentInsets = NSDirectionalEdgeInsets(top: 3, leading: 10, bottom: 3, trailing: 8)
+        // Capped so it fits the header at any text size.
+        chip.titleTextAttributesTransformer = UIConfigurationTextAttributesTransformer { attributes in
+            var attributes = attributes
+            attributes.font = UIFontMetrics(forTextStyle: .subheadline).scaledFont(for: .systemFont(ofSize: 15), maximumPointSize: 22)
+            return attributes
+        }
+        matchButton.configuration = chip
+        matchButton.isHidden = true
+        matchButton.addAction(UIAction { [weak self] _ in
+            guard let self else { return }
+            dismissedWord = StickerLibrary.typedWord(in: textDocumentProxy.documentContextBeforeInput)
+            showStickers()
+        }, for: .primaryActionTriggered)
+        let spacer = UIView()
+        spacer.setContentHuggingPriority(.defaultLow, for: .horizontal)
+        scopeButton.setContentCompressionResistancePriority(.defaultLow, for: .horizontal)
+        header.addArrangedSubview(scopeButton)
+        header.addArrangedSubview(spacer)
+        header.addArrangedSubview(matchButton)
+        header.axis = .horizontal
+        header.alignment = .center
+        header.spacing = 8
+        header.heightAnchor.constraint(greaterThanOrEqualToConstant: 32).isActive = true
+
+        scopeList.isHidden = true
+        scopeList.backgroundColor = .systemBackground
+        scopeList.onPick = { [weak self] folder in self?.pick(folder) }
+
+        // The header and banner sit above the grid (a hidden arranged view takes no space).
+        let column = UIStackView(arrangedSubviews: [header, bannerLabel, collectionView])
         column.axis = .vertical
         column.spacing = 4
         column.isLayoutMarginsRelativeArrangement = true
         column.directionalLayoutMargins = NSDirectionalEdgeInsets(top: 6, leading: 6, bottom: 0, trailing: 6)
 
-        for subview in [column, messageLabel, globeButton, toastLabel] as [UIView] {
+        for subview in [column, messageLabel, scopeList, globeButton, toastLabel] as [UIView] {
             subview.translatesAutoresizingMaskIntoConstraints = false
             inputView.addSubview(subview)
         }
@@ -175,6 +278,10 @@ final class KeyboardViewController: UIInputViewController {
             column.trailingAnchor.constraint(equalTo: inputView.trailingAnchor),
             column.bottomAnchor.constraint(equalTo: inputView.safeAreaLayoutGuide.bottomAnchor),
             messageLabel.centerYAnchor.constraint(equalTo: collectionView.centerYAnchor),
+            scopeList.topAnchor.constraint(equalTo: header.bottomAnchor),
+            scopeList.leadingAnchor.constraint(equalTo: inputView.leadingAnchor),
+            scopeList.trailingAnchor.constraint(equalTo: inputView.trailingAnchor),
+            scopeList.bottomAnchor.constraint(equalTo: inputView.safeAreaLayoutGuide.bottomAnchor),
             messageLabel.leadingAnchor.constraint(equalTo: inputView.leadingAnchor, constant: 24),
             messageLabel.trailingAnchor.constraint(equalTo: inputView.trailingAnchor, constant: -24),
             globeButton.leadingAnchor.constraint(equalTo: inputView.leadingAnchor, constant: 10),

@@ -12,8 +12,9 @@ import UniformTypeIdentifiers
 /// - stills: Signal redraws them on a 512×512 canvas as WebP at quality 0.8, which must come to ≤ 300 KiB
 /// - animated: APNG only (a GIF would show its first frame), square, 10–512 px, ≤ 300 KiB, looping forever
 ///
-/// Typical input: a folder of WeChat favorite stickers from export-wechat-emoji (GIF / JPG / PNG). The input folder is
-/// never written to; packs go to `pack-01`, `pack-02`, … in a separate output folder.
+/// Typical input: WeChat favorite stickers from export-wechat-emoji (GIF / JPG / PNG in folders of 50), as a folder or
+/// a ZIP archive. Subfolders and ZIP archives inside are searched too (see `ImageFinder`). The input is never written
+/// to; packs go to `pack-01`, `pack-02`, … in a separate output folder.
 public enum SignalPackExport {
     public static let stickerCount = 1...200
     public static let maxFileBytes = 300 * 1024
@@ -65,17 +66,24 @@ public enum SignalPackExport {
 
     public struct Report: Sendable {
         public let packs: [Pack]
-        /// Inputs that couldn't be converted, for the whole run.
+        /// Inputs that couldn't be converted, for the whole run, named by their path in the input.
         public let skipped: [Skipped]
+        /// Files in the input that aren't images, left out.
+        public let otherFiles: Int
+        /// The input had more images than one run converts (`ImageFinder.Limits.maxImages`); the rest were left out.
+        public let reachedImageLimit: Bool
+        /// Images and archives left out because unpacking them would have gone past `ImageFinder.Limits.maxTotalBytes`,
+        /// from `firstLeftOutAtByteLimit` (a path in the input) on.
+        public let leftOutAtByteLimit: Int
+        public let firstLeftOutAtByteLimit: String?
     }
-
-    private static let imageExtensions: Set<String> = ["gif", "png", "apng", "jpg", "jpeg", "webp", "heic", "heif", "tif", "tiff", "bmp"]
 
     // MARK: Converting
 
-    /// Converts one image (still or animated) into a Signal-ready sticker, without writing to disk.
-    public static func prepare(contentsOf url: URL) throws -> PreparedSticker {
-        let name = url.deletingPathExtension().lastPathComponent
+    /// Converts one image (still or animated) into a Signal-ready sticker, without writing to disk. `name` is the
+    /// sticker's source name, the file's own name by default.
+    public static func prepare(contentsOf url: URL, name: String? = nil) throws -> PreparedSticker {
+        let name = name ?? url.deletingPathExtension().lastPathComponent
         let sourceFrames = AnimatedImageLoader.frameCount(contentsOf: url)
         if sourceFrames > 1 {
             let animation = try AnimatedImageLoader.frames(contentsOf: url, maxPixelSize: pixelDimension,
@@ -162,49 +170,88 @@ public enum SignalPackExport {
 
     // MARK: Writing packs
 
-    /// Converts every image in `inputDirectory` (not recursive) and writes Signal-ready packs into `outputDirectory` as
-    /// `pack-01`, `pack-02`, … of up to `maxPerPack` stickers each.
+    /// Converts every image found in `input` and writes Signal-ready packs into `outputDirectory` as `pack-01`,
+    /// `pack-02`, … of up to `maxPerPack` stickers each. The input is a folder or a ZIP archive, searched with its
+    /// subfolders and the ZIP archives inside it (see `ImageFinder`); images in archives are unpacked into the
+    /// temporary folder on the output's volume, never next to the input.
     ///
-    /// The input folder is never written to. Pack folders that an earlier run left in the output (folders named
+    /// The input is never written to. Pack folders that an earlier run left in the output (folders named
     /// pack-NN holding only this tool's sticker files) make this throw `SignalPackError.outputHasPacks`, unless
     /// `replacingExisting` is set; they are then replaced once the new packs are ready, moved to the Trash if
     /// `movingReplacedToTrash` is set and deleted otherwise. Anything else named pack-NN is never touched, and is an
     /// error only if a new pack might need its name. The packs are built in a temporary folder on the same volume and
-    /// moved into place at the end, so a run that fails or is interrupted while converting leaves the output as it was.
+    /// moved into place at the end, so a run that fails or is cancelled (`cancelRuns`) before installing them leaves the
+    /// output as it was.
     @discardableResult
-    public static func writePacks(from inputDirectory: URL, to outputDirectory: URL,
+    public static func writePacks(from input: URL, to outputDirectory: URL,
                                   maxPerPack: Int = stickerCount.upperBound,
                                   replacingExisting: Bool = false,
-                                  movingReplacedToTrash: Bool = false) throws -> Report {
-        let maxPerPack = min(max(1, maxPerPack), stickerCount.upperBound)
-        try checkLocations(input: inputDirectory, output: outputDirectory)
-        let inputs = try listImages(in: inputDirectory)
-        guard !inputs.isEmpty else { throw SignalPackError.noImages(directory: inputDirectory.path) }
+                                  movingReplacedToTrash: Bool = false,
+                                  limits: ImageFinder.Limits = ImageFinder.Limits(),
+                                  willInstall: () -> Void = {}) throws -> Report {
+        try writePacks(from: input, to: outputDirectory, maxPerPack: maxPerPack, replacingExisting: replacingExisting,
+                       movingReplacedToTrash: movingReplacedToTrash, limits: limits, runState: .shared, committed: willInstall)
+    }
 
+    /// `writePacks`, cancelled through `runState`, telling `stagingCreated` where it builds the packs and calling
+    /// `committed` past the point of no return (for tests).
+    static func writePacks(from input: URL, to outputDirectory: URL, maxPerPack: Int, replacingExisting: Bool,
+                           movingReplacedToTrash: Bool, limits: ImageFinder.Limits, runState: RunState,
+                           stagingCreated: (URL) -> Void = { _ in }, committed: () -> Void = {}) throws -> Report {
+        let maxPerPack = min(max(1, maxPerPack), stickerCount.upperBound)
+        // Declared first so it runs last, after every cleanup below: a signal handler waiting in `waitForRuns` returns
+        // only once this run's temporary files are gone.
+        try runState.begin()
+        defer { runState.end() }
+        try checkLocations(input: input, output: outputDirectory)
         let fileManager = FileManager.default
+        // The cheap refusals first, before anything is unpacked.
         try fileManager.createDirectory(at: outputDirectory, withIntermediateDirectories: true)
         let existing = try packDirectories(in: outputDirectory)
         let previous = existing.filter(isPackFromThisTool)
         guard previous.isEmpty || replacingExisting else {
             throw SignalPackError.outputHasPacks(previous.map(\.lastPathComponent))
         }
+        // The staging folder holds images unpacked from ZIP archives (up to 2 GB), the packs being built and, while
+        // installing, the packs being replaced. Removed however the run ends, cancelling included (see `cancelRuns`);
+        // what a crashed or killed run left is removed by the next one.
+        let staging = try stagingDirectory(for: outputDirectory)
+        defer { try? fileManager.removeItem(at: staging) }
+        stagingCreated(staging)
+        removeStaleStaging(besides: staging)
+        let unpacked = staging.appendingPathComponent("unpacked", isDirectory: true)
+        try fileManager.createDirectory(at: unpacked, withIntermediateDirectories: false)
+        let found = try ImageFinder.find(in: physicalURL(input), workDirectory: unpacked, limits: limits,
+                                         checkCancelled: { try runState.checkCancelled() })
+        let inputs = found.images
+        let foundSkipped = found.skipped.map { Skipped(name: $0.path, reason: $0.reason) }
+        func nothingConverted(_ skipped: [Skipped]) -> SignalPackError {
+            found.leftOutAtByteLimit > 0
+                ? .tooLargeToUnpack(limit: limits.maxTotalBytes, leftOut: found.leftOutAtByteLimit,
+                                    firstLeftOut: found.firstLeftOutAtByteLimit ?? "", skipped: skipped)
+                : .nothingConverted(skipped)
+        }
+        guard !inputs.isEmpty else {
+            if found.leftOutAtByteLimit > 0 || !foundSkipped.isEmpty { throw nothingConverted(foundSkipped) }
+            throw SignalPackError.noImages(directory: input.path)
+        }
+
         // Something this tool didn't make, sitting where a new pack may go, is the user's: stop rather than touch it.
         let possibleNames = Set((1...((inputs.count + maxPerPack - 1) / maxPerPack)).map { packName($0).lowercased() })
         let blocking = existing.filter { !previous.contains($0) && possibleNames.contains($0.lastPathComponent.lowercased()) }
         guard blocking.isEmpty else { throw SignalPackError.outputHasOtherItems(blocking.map(\.lastPathComponent)) }
-        let staging = try stagingDirectory(for: outputDirectory)
-        defer { try? fileManager.removeItem(at: staging) }
 
         // Each sticker is written as soon as it is converted, so memory doesn't grow with the folder.
         var packs: [[WrittenSticker]] = []
-        var skipped: [Skipped] = []
-        for url in inputs {
+        var skipped = foundSkipped
+        for image in inputs {
+            try runState.checkCancelled()
             let sticker: PreparedSticker
             do {
-                sticker = try prepare(contentsOf: url)
+                sticker = try prepare(contentsOf: image.url, name: (image.fileName as NSString).deletingPathExtension)
             } catch {
                 let reason = (error as? LocalizedError)?.errorDescription ?? error.localizedDescription
-                skipped.append(Skipped(name: url.lastPathComponent, reason: reason))
+                skipped.append(Skipped(name: image.path, reason: reason))
                 continue
             }
             if packs.last.map({ $0.count >= maxPerPack }) ?? true {
@@ -219,23 +266,99 @@ public enum SignalPackExport {
             packs[packs.count - 1].append(WrittenSticker(fileURL: outputDirectory.appendingPathComponent(relativePath),
                                                          info: sticker.info))
         }
-        guard !packs.isEmpty else { throw SignalPackError.nothingConverted(skipped: skipped.count) }
+        guard !packs.isEmpty else { throw nothingConverted(skipped) }
 
+        try? fileManager.removeItem(at: unpacked)
+        // The last chance to stop. Installing can't be stopped: halfway, the output would have neither the old packs
+        // nor the new ones. A cancel from here on lets the run finish and report.
+        try runState.commit()
+        committed()
         try install(packCount: packs.count, from: staging, into: outputDirectory, replacing: previous,
                     trash: movingReplacedToTrash)
         return Report(packs: packs.enumerated().map { index, stickers in
             Pack(directory: outputDirectory.appendingPathComponent(packName(index + 1), isDirectory: true), stickers: stickers)
-        }, skipped: skipped)
+        }, skipped: skipped, otherFiles: found.otherFiles, reachedImageLimit: found.reachedImageLimit,
+           leftOutAtByteLimit: found.leftOutAtByteLimit, firstLeftOutAtByteLimit: found.firstLeftOutAtByteLimit)
     }
 
-    public static func listImages(in directory: URL) throws -> [URL] {
-        try FileManager.default.contentsOfDirectory(at: physicalURL(directory), includingPropertiesForKeys: [.isRegularFileKey],
-                                                    options: [.skipsHiddenFiles])
-            .filter { url in
-                imageExtensions.contains(url.pathExtension.lowercased())
-                    && (try? url.resolvingSymlinksInPath().resourceValues(forKeys: [.isRegularFileKey]))?.isRegularFile == true
-            }
-            .sorted { $0.lastPathComponent.localizedStandardCompare($1.lastPathComponent) == .orderedAscending }
+    // MARK: Cancelling
+
+    /// Stops the runs in progress, for a signal handler: each stops at its next check (between files, and between
+    /// chunks while unpacking), throwing `CancellationError`, and removes its temporary files on the way out. Runs
+    /// started afterwards stop at once. Returns true if a run had already started installing its packs; it then
+    /// finishes and returns its report, and `signal` is kept for `takeDeferredSignal`.
+    public static func cancelRuns(deferring signal: Int32) -> Bool {
+        RunState.shared.cancel(deferring: signal)
+    }
+
+    /// Waits until no run is in progress, their cleanup done.
+    public static func waitForRuns() {
+        RunState.shared.waitUntilIdle()
+    }
+
+    /// The signal a cancel came with while a run was installing, if any, once: for re-raising after the report.
+    public static func takeDeferredSignal() -> Int32? {
+        RunState.shared.takeDeferredSignal()
+    }
+
+    final class RunState: @unchecked Sendable {
+        static let shared = RunState()
+        private let condition = NSCondition()
+        private var running = 0
+        private var cancelled = false
+        /// Runs that started installing: they finish even if cancelled.
+        private var committed = 0
+        private var deferredSignal: Int32?
+
+        func begin() throws {
+            condition.lock()
+            defer { condition.unlock() }
+            if cancelled { throw CancellationError() }
+            running += 1
+        }
+
+        func end() {
+            condition.lock()
+            running -= 1
+            condition.broadcast()
+            condition.unlock()
+        }
+
+        func checkCancelled() throws {
+            condition.lock()
+            defer { condition.unlock() }
+            if cancelled { throw CancellationError() }
+        }
+
+        /// The point of no return: throws if cancelled already, and otherwise the run finishes whatever comes.
+        func commit() throws {
+            condition.lock()
+            defer { condition.unlock() }
+            if cancelled { throw CancellationError() }
+            committed += 1
+        }
+
+        func cancel(deferring signal: Int32? = nil) -> Bool {
+            condition.lock()
+            defer { condition.unlock() }
+            cancelled = true
+            if committed > 0, deferredSignal == nil { deferredSignal = signal }
+            return committed > 0
+        }
+
+        func waitUntilIdle() {
+            condition.lock()
+            while running > 0 { condition.wait() }
+            condition.unlock()
+        }
+
+        func takeDeferredSignal() -> Int32? {
+            condition.lock()
+            defer { condition.unlock() }
+            let signal = deferredSignal
+            deferredSignal = nil
+            return signal
+        }
     }
 
     /// Items directly in `directory` named like this tool's pack folders (pack-01, pack-02, …, in any case), whoever
@@ -273,8 +396,8 @@ public enum SignalPackExport {
 
     // MARK: Locations
 
-    /// Refuses an output folder that is, or is inside, the input folder, and an input folder that is, or is inside, a
-    /// pack folder this run would write or replace. Both paths are first resolved the way the kernel will resolve them
+    /// Refuses an output folder that is, or is inside, the input folder, and an input (folder or archive) that is, or is
+    /// inside, a pack folder this run would write or replace. Both paths are first resolved the way the kernel will resolve them
     /// (`physicalURL`) and folders are compared by file identity, so other spellings of a path (case, symlinks, `..`)
     /// can't slip past.
     static func checkLocations(input: URL, output: URL) throws {
@@ -325,16 +448,41 @@ public enum SignalPackExport {
     }
 
     /// A temporary folder on the output's volume (so installing is a rename), outside the output itself so an
-    /// interrupted run leaves nothing there. Falls back to a hidden folder in the output if the system has none.
+    /// interrupted run leaves nothing there. Falls back to a hidden folder in the output if the system has none. It is
+    /// marked with the process ID, for `removeStaleStaging`.
     private static func stagingDirectory(for output: URL) throws -> URL {
         let fileManager = FileManager.default
+        let staging: URL
         if let temporary = try? fileManager.url(for: .itemReplacementDirectory, in: .userDomainMask,
                                                 appropriateFor: physicalURL(output), create: true) {
-            return temporary
+            staging = temporary
+        } else {
+            staging = output.appendingPathComponent(".signal-pack-\(UUID().uuidString)", isDirectory: true)
+            try fileManager.createDirectory(at: staging, withIntermediateDirectories: false)
         }
-        let hidden = output.appendingPathComponent(".signal-pack-\(UUID().uuidString)", isDirectory: true)
-        try fileManager.createDirectory(at: hidden, withIntermediateDirectories: false)
-        return hidden
+        try? Data(String(getpid()).utf8).write(to: staging.appendingPathComponent(stagingMarker))
+        return staging
+    }
+
+    private static let stagingMarker = ".signal-pack-run"
+
+    /// Removes staging folders next to `staging` that runs which have since ended left behind: killed outright, or
+    /// crashed. Only folders with this tool's marker whose process is gone; packs a crashed install had moved aside go to
+    /// the Trash.
+    private static func removeStaleStaging(besides staging: URL) {
+        let fileManager = FileManager.default
+        let parent = staging.deletingLastPathComponent()
+        guard let siblings = try? fileManager.contentsOfDirectory(at: parent, includingPropertiesForKeys: nil) else { return }
+        for folder in siblings where folder.lastPathComponent != staging.lastPathComponent {
+            guard let marker = try? String(contentsOf: folder.appendingPathComponent(stagingMarker), encoding: .utf8),
+                  let pid = pid_t(marker), pid > 0, kill(pid, 0) == -1, errno == ESRCH
+            else { continue }
+            let previous = folder.appendingPathComponent("previous", isDirectory: true)
+            for pack in (try? fileManager.contentsOfDirectory(at: previous, includingPropertiesForKeys: nil)) ?? [] {
+                try? fileManager.trashItem(at: pack, resultingItemURL: nil)
+            }
+            try? fileManager.removeItem(at: folder)
+        }
     }
 
     /// Moves the staged packs into place. Packs being replaced are first moved into the staging folder; if anything
@@ -378,25 +526,34 @@ public enum SignalPackExport {
 
 public enum SignalPackError: LocalizedError, Equatable {
     case noImages(directory: String)
-    case nothingConverted(skipped: Int)
+    /// Every image was skipped, for these reasons.
+    case nothingConverted([SignalPackExport.Skipped])
     case outputInsideInput
     case inputInsidePackFolder(String)
     case outputHasPacks([String])
     case outputHasOtherItems([String])
     case emptyAnimation
+    /// Nothing was converted, and `leftOut` images and archives, from `firstLeftOut` on, weren't unpacked because the
+    /// run's limit was reached; the others were skipped for these reasons.
+    case tooLargeToUnpack(limit: UInt64, leftOut: Int, firstLeftOut: String, skipped: [SignalPackExport.Skipped])
 
     public var errorDescription: String? {
         switch self {
         case let .noImages(directory): "No images found in \(directory)."
-        case let .nothingConverted(skipped): "None of the \(skipped) images could be converted."
-        case .outputInsideInput: "The output folder must be outside the input folder, so the originals are never touched."
+        case let .nothingConverted(skipped):
+            skipped.allSatisfy({ $0.reason == ZipError.encrypted.errorDescription })
+                ? "The images are password-protected, which isn't supported. Unzip the archive with its password, then convert the folder."
+                : "Nothing could be converted: \(skipped.count == 1 ? "1 item was" : "\(skipped.count) items were") skipped."
+        case .outputInsideInput: "The output folder must be outside the input, so the originals are never touched."
         case let .inputInsidePackFolder(name):
-            "The input folder is, or is inside, \(name) in the output folder, which this run would write into or replace. Choose another output folder."
+            "The input is, or is inside, \(name) in the output folder, which this run would write into or replace. Choose another output folder."
         case let .outputHasPacks(names):
             "The output folder already has \(names.joined(separator: ", ")) from an earlier run. Choose another folder or replace them."
         case let .outputHasOtherItems(names):
             "The output folder has \(names.joined(separator: ", ")), which this tool didn't make, where new packs would go. Move them or choose another folder."
         case .emptyAnimation: "Every frame of the animation is transparent."
+        case let .tooLargeToUnpack(limit, leftOut, firstLeftOut, _):
+            "Nothing could be converted, and \(leftOut == 1 ? "1 file was" : "\(leftOut) files were") left out from \(ImageFinder.displayPath(firstLeftOut)) on: unpacking \(leftOut == 1 ? "it" : "them") would take more than \(ByteCountFormatter.string(fromByteCount: Int64(clamping: limit), countStyle: .memory)), the most one run unpacks. Unzip the archive first, then convert the folder."
         }
     }
 }

@@ -177,27 +177,27 @@ final class StickerEditorModel {
         toggle(id)
     }
 
-    /// Encodes and saves the sticker. Returns false (and sets `errorMessage`) on failure.
-    func save(to store: StickerStore) async -> Bool {
-        guard canSave, let image = source else { return false }
+    /// Encodes and saves the sticker into `folder`, in its subfolders `path`, right after the sticker `after` (see
+    /// `StickerStore.add`). Returns nil (and sets `errorMessage`) on failure.
+    func save(to store: StickerStore, in folder: UUID? = nil, path: [String] = [], after: UUID? = nil) async -> Sticker? {
+        guard canSave, let image = source else { return nil }
         isSaving = true
         defer { isSaving = false }
         let analysis = analysis, recipe = recipe, name = name
         let animation = isAnimationMode ? animation : nil
         let emoji = emoji.isEmpty ? nil : emoji
         do {
-            try await Task.detached(priority: .userInitiated) {
+            return try await Task.detached(priority: .userInitiated) {
                 let encoded = if let animation {
                     try AnimatedStickerEncoder.encode(animation)
                 } else {
                     try StickerMaker.make(image, analysis: analysis, recipe: recipe)
                 }
-                try store.add(encoded, name: name, emoji: emoji)
+                return try store.add(encoded, name: name, emoji: emoji, in: folder, path: path, after: after)
             }.value
-            return true
         } catch {
             errorMessage = Self.describe(error)
-            return false
+            return nil
         }
     }
 

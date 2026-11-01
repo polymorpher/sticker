@@ -23,6 +23,8 @@ struct ImportedImage: Identifiable, Sendable {
     let isAnimated: Bool
     /// Bytes the decoded frames of an animation may take.
     let animationMemoryBudget: Int
+    /// Folders to save it in, below where the import goes: its folders inside a ZIP archive (see `ImportFolders`).
+    var folderPath: [String] = []
 
     /// The image as a still (an animation's first frame).
     func decode() throws -> CGImage {
@@ -42,9 +44,77 @@ struct ImportedImage: Identifiable, Sendable {
 }
 
 /// Turns whatever the user hands us (photo data, files, pasteboard or drag items, share-sheet attachments) into
-/// imported images. Everything is decoded by ImageIO, so any format it reads works, plus page 1 of a PDF.
+/// imported images. Everything is decoded by ImageIO, so any format it reads works, plus page 1 of a PDF. A ZIP archive
+/// gives every image inside it, in subfolders and nested archives too (see `ImageFinder`).
 enum ImageImport {
-    static let supportedTypes: [UTType] = [.image, .pdf]
+    static let supportedTypes: [UTType] = [.image, .pdf, .zip]
+
+    /// Most images one import opens: each gets an editor step, and a ZIP archive can hold thousands.
+    static let maxImagesPerImport = 500
+
+    /// What an import brought in.
+    struct Loaded: Sendable {
+        var images: [ImportedImage] = []
+        /// Items that couldn't be used, counted per image for ZIP archives (damaged, password-protected, unreadable).
+        var failures = 0
+        /// Files in ZIP archives skipped for a limit: larger than one file may be, or nested too deep.
+        var overLimit = 0
+        /// More images were there than `maxImagesPerImport`; the rest were left out.
+        var reachedLimit = false
+        /// Bytes unpacked from ZIP archives, against `ImageFinder.Limits.maxTotalBytes`.
+        var unpackedBytes: UInt64 = 0
+        /// Archive records read, against `ImageFinder.Limits.maxEntries`.
+        var archiveEntries = 0
+        /// Files left out because unpacking ZIP archives would have gone past `maxTotalBytes` (images, archives that
+        /// may hold many, and the items picked after them), from `firstLeftOut` (with the picked archive's name) on.
+        var leftOutAtByteLimit = 0
+        var firstLeftOut: String?
+        /// A ZIP archive had more files than the import's `ImageFinder.Limits.maxEntries`.
+        var tooManyFiles = false
+        /// Items that couldn't be copied or unpacked, with why (a full disk), in words to show.
+        var unpackProblems: [(reason: String, item: String?)] = []
+
+        mutating func add(_ other: Loaded) {
+            images += other.images
+            failures += other.failures
+            overLimit += other.overLimit
+            firstLeftOut = firstLeftOut ?? other.firstLeftOut
+            reachedLimit = reachedLimit || other.reachedLimit
+            unpackedBytes += other.unpackedBytes
+            archiveEntries += other.archiveEntries
+            leftOutAtByteLimit += other.leftOutAtByteLimit
+            tooManyFiles = tooManyFiles || other.tooManyFiles
+            unpackProblems += other.unpackProblems
+        }
+
+        /// Counts what loading one item (named `item`, if it has a name) threw: a limit or a failure to copy or unpack
+        /// is said as such, anything else is an item that couldn't be read.
+        mutating func add(_ error: Error, item: String?) {
+            switch error {
+            case ImageFinder.FinderError.tooManyFiles:
+                tooManyFiles = true
+            case let ImageFinder.FinderError.cannotUnpack(path, reason):
+                // The whole item failed (what an archive had unpacked is dropped with it), so it is named, not the entry.
+                unpackProblems.append((reason, item ?? path))
+            case let error as CocoaError where error.code == .fileWriteOutOfSpace:
+                // Copying the item failed for lack of space, before anything could be read: the same reason as unpacking.
+                unpackProblems.append((ImageFinder.notEnoughSpace, item))
+            default:
+                failures += 1
+            }
+        }
+
+        /// The import's byte budget ran out: by the same rule as within an archive, the items after are left out too.
+        var isPastByteLimit: Bool { leftOutAtByteLimit > 0 }
+
+        /// What's left for the rest of the same import: one budget of images, unpacked bytes and archive records for
+        /// every file in it.
+        var remaining: ImageFinder.Limits {
+            var limits = ImageFinder.Limits()
+            limits.maxImages = maxImagesPerImport
+            return limits.remaining(images: images.count, unpackedBytes: unpackedBytes, archiveEntries: archiveEntries)
+        }
+    }
 
     /// Where imported files are copied until they're edited. Cleared by `discard(_:)` and `purgeTemporaryFiles()`.
     static let temporaryDirectory = FileManager.default.temporaryDirectory.appendingPathComponent("Imports", isDirectory: true)
@@ -75,8 +145,10 @@ enum ImageImport {
     }
 
     /// Copies a file picked with `.fileImporter` (possibly outside the sandbox, possibly still in iCloud) into our
-    /// temporary directory, so it can be decoded later without holding security-scoped access.
-    static func image(pickedFile url: URL, maxPixelSize: Int = StickerSpec.importMaxPixelDimension) async throws -> ImportedImage {
+    /// temporary directory, so it can be decoded later without holding security-scoped access. A ZIP archive is
+    /// unpacked within `limits` (what's left of the import's).
+    static func images(pickedFile url: URL, maxPixelSize: Int = StickerSpec.importMaxPixelDimension,
+                       limits: ImageFinder.Limits = Loaded().remaining) async throws -> Loaded {
         try await Task.detached(priority: .userInitiated) {
             let scoped = url.startAccessingSecurityScopedResource()
             defer { if scoped { url.stopAccessingSecurityScopedResource() } }
@@ -88,26 +160,79 @@ enum ImageImport {
                 do { try FileManager.default.copyItem(at: readURL, to: copy) } catch { copyError = error }
             }
             if let error = coordinationError ?? copyError { throw error }
-            return try image(ownedFile: copy, name: url.lastPathComponent, maxPixelSize: maxPixelSize)
+            if ImageFinder.isArchive(copy) {
+                return try images(inArchive: copy, named: url.lastPathComponent, maxPixelSize: maxPixelSize, limits: limits)
+            }
+            return Loaded(images: [try image(ownedFile: copy, name: url.lastPathComponent, maxPixelSize: maxPixelSize)])
         }.value
+    }
+
+    /// Every image in a ZIP archive we own (a temporary copy, removed here) within `limits`, each named after its own
+    /// file and given the archive's folders (see `ImportFolders`). `name` is the archive's own: it can name the top
+    /// folder, and says where files were left out.
+    static func images(inArchive archive: URL, named name: String?, maxPixelSize: Int, limits: ImageFinder.Limits) throws -> Loaded {
+        defer { try? FileManager.default.removeItem(at: archive) }
+        try FileManager.default.createDirectory(at: temporaryDirectory, withIntermediateDirectories: true)
+        let found: ImageFinder.Result
+        do {
+            found = try ImageFinder.find(in: archive, workDirectory: temporaryDirectory, includingPDFs: true, limits: limits)
+        } catch let ImageFinder.FinderError.cannotUnpack(path, reason) {
+            // Named by the picked archive too, as several may be.
+            throw ImageFinder.FinderError.cannotUnpack(path: name.map { $0 + "/" + path } ?? path, reason: reason)
+        }
+        var loaded = Loaded(failures: found.skipped.filter { !$0.exceedsLimit }.count,
+                            overLimit: found.skipped.filter(\.exceedsLimit).count, reachedLimit: found.reachedImageLimit,
+                            unpackedBytes: found.unpackedBytes, archiveEntries: found.archiveEntries,
+                            leftOutAtByteLimit: found.leftOutAtByteLimit,
+                            firstLeftOut: found.firstLeftOutAtByteLimit.map { first in name.map { $0 + "/" + first } ?? first })
+        let folders = ImportFolders.paths(rootName: name, entries: found.images.map(\.path),
+                                          complete: !found.reachedImageLimit && found.leftOutAtByteLimit == 0)
+        for (item, folderPath) in zip(found.images, folders) {
+            do {
+                var imported = try image(ownedFile: item.url, name: item.fileName, maxPixelSize: maxPixelSize)
+                imported.folderPath = folderPath
+                loaded.images.append(imported)
+            } catch {
+                loaded.failures += 1
+            }
+        }
+        guard !loaded.images.isEmpty || loaded.failures > 0 || loaded.overLimit > 0 || loaded.reachedLimit || loaded.leftOutAtByteLimit > 0 else {
+            throw ImageLoadingError.unreadable
+        }
+        return loaded
     }
 
     /// Main-actor bound because NSItemProvider isn't Sendable; loading is callback based.
     @MainActor
-    static func images(from providers: [NSItemProvider], maxPixelSize: Int = StickerSpec.importMaxPixelDimension) async -> (images: [ImportedImage], failures: Int) {
-        var images: [ImportedImage] = []
-        var failures = 0
+    static func images(from providers: [NSItemProvider], maxPixelSize: Int = StickerSpec.importMaxPixelDimension) async -> Loaded {
+        var loaded = Loaded()
         for provider in providers {
+            let remaining = loaded.remaining
+            guard remaining.maxImages > 0 else {
+                loaded.reachedLimit = true
+                break
+            }
+            if loaded.isPastByteLimit {
+                loaded.leftOutAtByteLimit += 1
+                continue
+            }
             do {
                 let copy = try await provider.copyImageFile()
+                if ImageFinder.isArchive(copy.url) {
+                    let name = provider.suggestedName ?? copy.originalName
+                    loaded.add(try await Task.detached(priority: .userInitiated) {
+                        try ImageImport.images(inArchive: copy.url, named: name, maxPixelSize: maxPixelSize, limits: remaining)
+                    }.value)
+                    continue
+                }
                 // Photos and Files give the file's name as suggestedName; otherwise use the delivered file's name.
                 let name = StickerName.fromFileName(provider.suggestedName) != nil ? provider.suggestedName : copy.originalName
-                images.append(try image(ownedFile: copy.url, name: name, maxPixelSize: maxPixelSize))
+                loaded.images.append(try image(ownedFile: copy.url, name: name, maxPixelSize: maxPixelSize))
             } catch {
-                failures += 1
+                loaded.add(error, item: provider.suggestedName)
             }
         }
-        return (images, failures)
+        return loaded
     }
 
     /// Deletes the temporary copies behind `items` once they're saved or skipped.
@@ -179,6 +304,8 @@ extension NSItemProvider {
                     }
                 }
             }
+        } catch let error as CocoaError where error.code == .fileWriteOutOfSpace {
+            throw error // writing the same bytes from memory can't fit either
         } catch {
             let data: Data = try await withCheckedThrowingContinuation { continuation in
                 _ = loadDataRepresentation(for: type) { data, error in
@@ -186,7 +313,12 @@ extension NSItemProvider {
                 }
             }
             let copy = try ImageImport.temporaryURL(pathExtension: extensionHint)
-            try data.write(to: copy)
+            do {
+                try data.write(to: copy)
+            } catch {
+                try? FileManager.default.removeItem(at: copy)
+                throw error
+            }
             return (copy, nil)
         }
     }

@@ -89,6 +89,17 @@ final class AnimatedStickerTests: XCTestCase {
         XCTAssertEqual(thinned.delays.last ?? 0, 2.0, accuracy: 1e-9, "the held frame is kept, with its time")
     }
 
+    /// Icons hold several sizes and MPOs a stereo pair: several images, but not an animation.
+    func testImagesWithSeveralSizesAreStills() throws {
+        let data = NSMutableData()
+        let destination = try XCTUnwrap(CGImageDestinationCreateWithData(data, UTType.icns.identifier as CFString, 3, nil))
+        for side in [16, 32, 128] { CGImageDestinationAddImage(destination, TestImages.halves(width: side, height: side), nil) }
+        XCTAssertTrue(CGImageDestinationFinalize(destination))
+        let source = try XCTUnwrap(CGImageSourceCreateWithData(data, nil))
+        XCTAssertEqual(CGImageSourceGetCount(source), 3)
+        XCTAssertEqual(AnimatedImageLoader.frameCount(of: data as Data), 1)
+    }
+
     func testStillImagesHaveOneFrame() {
         XCTAssertEqual(AnimatedImageLoader.frameCount(of: TestImages.encode(TestImages.halves(width: 20, height: 20), type: .png)), 1)
         XCTAssertEqual(AnimatedImageLoader.frameCount(contentsOf: Samples.url("test.jpg")), 1)

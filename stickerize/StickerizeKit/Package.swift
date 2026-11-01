@@ -27,8 +27,10 @@ let package = Package(
             .product(name: "libwebp", package: "libwebp-Xcode"),
         ]),
         .executableTarget(name: "stickerize", dependencies: ["StickerizeKit", "StickerLift", "StickerExport"]),
-        .testTarget(name: "StickerizeKitTests", dependencies: ["StickerizeKit"]),
+        // Test helpers shared by the test targets (a ZIP writer for archive fixtures). Not a product.
+        .target(name: "StickerizeTestSupport", dependencies: ["StickerizeKit"], path: "Tests/TestSupport"),
+        .testTarget(name: "StickerizeKitTests", dependencies: ["StickerizeKit", "StickerizeTestSupport"]),
         .testTarget(name: "StickerLiftTests", dependencies: ["StickerizeKit", "StickerLift"]),
-        .testTarget(name: "StickerExportTests", dependencies: ["StickerizeKit", "StickerExport"]),
+        .testTarget(name: "StickerExportTests", dependencies: ["StickerizeKit", "StickerExport", "StickerizeTestSupport"]),
     ]
 )

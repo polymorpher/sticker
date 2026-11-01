@@ -9,6 +9,7 @@ struct StickerDetailView: View {
     @State private var emoji = ""
     @State private var image: UIImage?
     @State private var confirmsDelete = false
+    @State private var showsMove = false
     @State private var status: String? {
         didSet { if let status { AccessibilityNotification.Announcement(status).post() } }
     }
@@ -57,6 +58,15 @@ struct StickerDetailView: View {
                         if filtered != newValue { emoji = filtered }
                     }
                     .onSubmit { save(sticker) }
+                Button {
+                    showsMove = true
+                } label: {
+                    LabeledContent("Folder") {
+                        let path = library.library.path(to: sticker.folderID).map(\.name)
+                        Text(path.isEmpty ? String(localized: "Top Level") : path.joined(separator: " › "))
+                    }
+                }
+                .accessibilityHint(Text("Moves the sticker to another folder"))
             }
 
             Section {
@@ -73,7 +83,7 @@ struct StickerDetailView: View {
                     Task {
                         do {
                             try await StickerActions.saveToPhotos(sticker, from: library.store)
-                            status = String(localized: "Saved. To add it to your iPhone stickers too, open it in Photos, touch and hold the subject, then tap Add Sticker.")
+                            status = String(localized: "Saved. To add it to your iPhone stickers too, open it in Photos, touch and hold the subject, then tap Add Sticker. Stickers sent from your iPhone stickers can be saved by the people you send them to.")
                         } catch {
                             library.show("Couldn't Save to Photos", error)
                         }
@@ -107,6 +117,11 @@ struct StickerDetailView: View {
                 }
                 return ImageLoader.thumbnail(contentsOf: url, maxPixelSize: 1024).map { UIImage(cgImage: $0) }
             }.value
+        }
+        .sheet(isPresented: $showsMove, onDismiss: library.presentMessageAgain) {
+            FolderPicker(title: String(localized: "Move Sticker"), current: .some(sticker.folderID), excluded: []) { folder in
+                try library.attempt { try library.store.move([sticker.id], to: folder) }
+            }
         }
         .confirmationDialog("Delete this sticker?", isPresented: $confirmsDelete, titleVisibility: .visible) {
             Button("Delete", role: .destructive) {

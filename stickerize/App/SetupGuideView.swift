@@ -13,6 +13,7 @@ struct SetupGuideView: View {
                 Section {
                     Step(number: 1, text: "In any app, open the emoji keyboard and tap Stickers. Stickerize has its own tab there.")
                     Step(number: 2, text: "In Messages, tap + and choose Stickers, then Stickerize. Tap a sticker to add it, or touch and hold to peel it onto a message.")
+                    Step(number: 3, text: "Tap the name at the top to show one folder, or the magnifying glass to search by name, emoji or folder.")
                 } header: {
                     Label("Messages and the Emoji Keyboard", systemImage: "message")
                 } footer: {
@@ -23,6 +24,7 @@ struct SetupGuideView: View {
                     Step(number: 1, text: "Open Settings › General › Keyboard › Keyboards › Add New Keyboard and choose Stickerize.")
                     Step(number: 2, text: "Tap Stickerize in that list and turn on Allow Full Access. It's needed to copy stickers; Stickerize has no network code and never sees what you type elsewhere.")
                     Step(number: 3, text: "In a chat, switch to the Stickerize keyboard with the globe key, tap a sticker, then touch and hold the message field and tap Paste.")
+                    Step(number: 4, text: "To find a sticker, type a word such as “cat” before switching: the keyboard shows the stickers that match it.")
                     Button("Open Settings", systemImage: "gear") {
                         if let url = URL(string: UIApplication.openSettingsURLString) { openURL(url) }
                     }
@@ -40,12 +42,13 @@ struct SetupGuideView: View {
                 }
 
                 Section {
-                    Step(number: 1, text: "Open a sticker and tap Save to Photos.")
+                    Step(number: 1, text: "Open a sticker and tap Save to Photos, or tap Select, choose several, then Add to… › Save to Photos.")
                     Step(number: 2, text: "In Photos, open it, touch and hold the subject, then tap Add Sticker. iOS cuts the subject out again, so very thin parts may be trimmed.")
+                    Step(number: 3, text: "Send it from your own stickers in the Stickers drawer. People you send it to can touch and hold it and tap Save to Stickers, or Sticker Details › Save if it was placed on a message (iOS 17.2 or later).")
                 } header: {
-                    Label("Your iPhone's Own Sticker Library", systemImage: "photo.on.rectangle")
+                    Label("Stickers Friends Can Save", systemImage: "photo.on.rectangle")
                 } footer: {
-                    Text("Apps can't add to that library directly; this is the way iOS offers.")
+                    Text("Apps can't add to your iPhone's sticker library directly; this is the way iOS offers. iOS lets people save only stickers made on the sender's iPhone: for a sticker sent from the Stickerize tab, Sticker Details only shows which app it came from.")
                 }
 
                 Section("Storage") {

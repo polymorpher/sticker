@@ -7,7 +7,8 @@ public enum StickerName {
     public static var fallback: String { String(localized: "Sticker") }
 
     /// The sticker name for a file name, or nil when the name carries no meaning: camera and screenshot names
-    /// ("IMG_1234", "PXL_20260102_…", "Screenshot 2026-…"), temporary UUID names, bare numbers, "image".
+    /// ("IMG_1234", "PXL_20260102_…", "Screenshot 2026-…"), temporary UUID names, hashes (WeChat names sticker files by
+    /// their MD5), bare numbers, "image".
     public static func fromFileName(_ fileName: String?) -> String? {
         guard var name = fileName.map({ ($0 as NSString).lastPathComponent }), !name.isEmpty else { return nil }
         // Drop the extension only when it is an image or PDF type, so "v1.5 final" keeps its dot.
@@ -27,6 +28,8 @@ public enum StickerName {
         #"^(screenshot|screen shot|simulator screenshot|screen recording)\b"#,
         #"^(image|photo|picture|untitled|unknown|download|file)( \d+)?$"#,
         #"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}"#,
+        // Hashes have digits and letters (a name of only a–f letters, like "facade", is a word).
+        #"^(?=[0-9a-f]*\d)(?=[0-9a-f]*[a-f])[0-9a-f]{16,}$"#,
         #"^[\d .()-]+$"#,
     ].map { try! NSRegularExpression(pattern: $0, options: [.caseInsensitive]) }
 

@@ -14,12 +14,14 @@ public struct Sticker: Codable, Hashable, Identifiable, Sendable {
     public let byteCount: Int
     /// PNG for stills, GIF for animated stickers.
     public let format: StickerFormat
+    /// The folder it's in; nil for the top level. Nil in manifests from before folders.
+    public var folderID: UUID?
 
     public var fileName: String { id.uuidString + "." + format.fileExtension }
     public var isAnimated: Bool { format == .gif }
 
     public init(id: UUID = UUID(), name: String, emoji: String? = nil, createdAt: Date = Date(),
-                pixelWidth: Int, pixelHeight: Int, byteCount: Int, format: StickerFormat = .png) {
+                pixelWidth: Int, pixelHeight: Int, byteCount: Int, format: StickerFormat = .png, folderID: UUID? = nil) {
         self.id = id
         self.name = name
         self.emoji = emoji
@@ -28,6 +30,7 @@ public struct Sticker: Codable, Hashable, Identifiable, Sendable {
         self.pixelHeight = pixelHeight
         self.byteCount = byteCount
         self.format = format
+        self.folderID = folderID
     }
 
     public init(from decoder: Decoder) throws {
@@ -41,22 +44,104 @@ public struct Sticker: Codable, Hashable, Identifiable, Sendable {
         byteCount = try container.decode(Int.self, forKey: .byteCount)
         // Manifests written before animated stickers existed have no format: everything was PNG.
         format = try container.decodeIfPresent(StickerFormat.self, forKey: .format) ?? .png
+        // Lenient: a bad value puts the sticker at the top level instead of failing the whole manifest.
+        folderID = try? container.decodeIfPresent(UUID.self, forKey: .folderID)
     }
 }
 
-struct StickerManifest: Codable {
-    static let currentVersion = 1
+struct StickerManifest: Codable, Equatable {
+    /// 2 added folders. The value is the newest schema that may have written the file, not a promise that the file
+    /// has that schema's data: a version 1 build decodes a version 2 file, drops what it doesn't know, and writes it
+    /// back still saying 2.
+    static let currentVersion = 2
     var version = currentVersion
-    /// Display order: index 0 is shown first.
+    /// Display order: index 0 is shown first. A folder shows its stickers in this order too.
     var stickers: [Sticker] = []
+    /// In no particular order: siblings are shown sorted by name.
+    var folders: [StickerFolder] = []
+
+    init(version: Int = currentVersion, stickers: [Sticker] = [], folders: [StickerFolder] = []) {
+        self.version = version
+        self.stickers = stickers
+        self.folders = folders
+    }
+
+    init(from decoder: Decoder) throws {
+        let container = try decoder.container(keyedBy: CodingKeys.self)
+        version = try container.decodeIfPresent(Int.self, forKey: .version) ?? 1
+        stickers = try container.decode([Sticker].self, forKey: .stickers)
+        // One folder that can't be read is dropped (its stickers end up at the top level); it never costs the stickers.
+        folders = (try? container.decodeIfPresent([Lossy<StickerFolder>].self, forKey: .folders))?.compactMap(\.value) ?? []
+    }
+
+    /// Repairs what a bad write, a downgrade or a bug could leave behind, without ever dropping a sticker: in order,
+    /// duplicate folders (the first wins), folders whose parent is gone (to the top level), parent cycles (each
+    /// folder, in array order, whose parent chain comes back to it moves to the top level), duplicate stickers (the
+    /// first wins), and stickers whose folder is gone (to the top level).
+    func normalized() -> StickerManifest {
+        var seenFolders = Set<UUID>()
+        var folders = self.folders.filter { seenFolders.insert($0.id).inserted }
+        for index in folders.indices where folders[index].parentID.map({ !seenFolders.contains($0) }) ?? false {
+            folders[index].parentID = nil
+        }
+        var parents = Dictionary(folders.map { ($0.id, $0.parentID) }, uniquingKeysWith: { first, _ in first })
+        for index in folders.indices {
+            var visited = Set<UUID>()
+            var next = folders[index].parentID
+            while let current = next {
+                if current == folders[index].id {
+                    folders[index].parentID = nil
+                    parents[current] = .some(nil)
+                    break
+                }
+                // A cycle further up that doesn't come back here: its own folders break it on their turn.
+                guard visited.insert(current).inserted else { break }
+                next = parents[current] ?? nil
+            }
+        }
+        var seenStickers = Set<UUID>()
+        var stickers = self.stickers.filter { seenStickers.insert($0.id).inserted }
+        for index in stickers.indices where stickers[index].folderID.map({ !seenFolders.contains($0) }) ?? false {
+            stickers[index].folderID = nil
+        }
+        return StickerManifest(version: version, stickers: stickers, folders: folders)
+    }
+}
+
+/// Decodes to nil instead of throwing, so one bad element doesn't fail a whole array.
+private struct Lossy<Value: Decodable>: Decodable {
+    let value: Value?
+    init(from decoder: Decoder) throws { value = try? Value(from: decoder) }
+}
+
+/// Just the schema version, read before anything else.
+private struct ManifestVersion: Decodable {
+    let version: Int?
+}
+
+/// What this build can read of a manifest from a newer one: every sticker and folder it understands.
+private struct LenientManifest: Decodable {
+    let stickers: [Lossy<Sticker>]?
+    let folders: [Lossy<StickerFolder>]?
 }
 
 public enum StickerStoreError: LocalizedError, Equatable {
     case notFound(UUID)
+    case folderNotFound(UUID)
+    case folderNameTaken(String)
+    /// A folder can't go inside itself or one of its own folders.
+    case folderCycle
+    /// The library was last written by a newer version of Stickerize; writing it here could lose what that version added.
+    case manifestFromNewerVersion
 
     public var errorDescription: String? {
         switch self {
-        case .notFound: "That sticker no longer exists."
+        case .notFound: String(localized: "That sticker no longer exists.")
+        case .folderNotFound: String(localized: "That folder no longer exists.")
+        case let .folderNameTaken(name): String(localized: "There's already a folder named “\(name)” here.")
+        case .folderCycle: String(localized: "A folder can't go inside itself.")
+        case .manifestFromNewerVersion:
+            String(localized: "Your stickers were last changed by a newer version of Stickerize. Update the app to change them.")
         }
     }
 }
@@ -113,24 +198,23 @@ public final class StickerStore: Sendable {
 
     // MARK: Reading
 
-    /// All stickers in display order. Entries whose PNG is missing are skipped.
+    /// The stickers and folders, read together. Stickers whose image file is missing are left out.
     ///
-    /// - Parameter coordinated: Pass false from a keyboard extension without Full Access: its sandbox makes the App
-    ///   Group read-only, so it should just read files. Writers replace files atomically, so a plain read never sees
-    ///   a half-written manifest.
-    public func stickers(coordinated: Bool = true) throws -> [Sticker] {
-        guard FileManager.default.fileExists(atPath: directory.path) else { return [] }
-        var result: Result<[Sticker], Error> = .success([])
-        if coordinated {
-            var coordinationError: NSError?
-            NSFileCoordinator(filePresenter: nil).coordinate(readingItemAt: manifestURL, options: [], error: &coordinationError) { url in
-                result = Result { try loadManifest(at: url).stickers }
-            }
-            if let coordinationError { throw coordinationError }
-        } else {
-            result = Result { try loadManifest(at: manifestURL).stickers }
-        }
-        return try result.get().filter { FileManager.default.fileExists(atPath: fileURL(for: $0).path) }
+    /// A plain read, never coordinated: writers replace the manifest atomically, so a read never sees half a write,
+    /// and it can't block behind a writer (the app reads on the main thread) or need write access (a keyboard
+    /// extension without Full Access can only read the App Group). Reading never changes anything on disk; a
+    /// manifest that can't be decoded is rebuilt in memory and repaired by the next write.
+    public func library() throws -> StickerLibrary {
+        guard FileManager.default.fileExists(atPath: directory.path) else { return StickerLibrary() }
+        let manifest = try loadManifest(at: manifestURL, repairing: false)
+        // One directory listing instead of a check per sticker.
+        let files = Set((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+        return StickerLibrary(stickers: manifest.stickers.filter { files.contains($0.fileName) }, folders: manifest.folders)
+    }
+
+    /// All stickers in display order. Entries whose image file is missing are skipped.
+    public func stickers() throws -> [Sticker] {
+        try library().stickers
     }
 
     public func fileURL(for sticker: Sticker) -> URL {
@@ -156,19 +240,41 @@ public final class StickerStore: Sendable {
 
     // MARK: Writing
 
-    /// Saves an encoded sticker at the front of the library.
+    /// Saves an encoded sticker at the front of the library, or right after `after` if that sticker still exists (so
+    /// a batch saved one by one keeps its own order).
+    ///
+    /// It goes into `folder` (the top level when nil, or when that folder has since been deleted), in the subfolder
+    /// chain `path` below it: each level is the first subfolder whose name matches (`FolderName.key`), or a new one.
+    /// Folders are created only here, in the same write as the sticker, so skipping images never leaves empty ones.
+    /// The returned sticker's `folderID` is where it actually went.
     @discardableResult
-    public func add(_ encoded: EncodedSticker, name: String, emoji: String? = nil) throws -> Sticker {
-        let sticker = Sticker(name: Self.cleanName(name), emoji: Self.cleanEmoji(emoji), pixelWidth: encoded.pixelWidth,
+    public func add(_ encoded: EncodedSticker, name: String, emoji: String? = nil, in folder: UUID? = nil,
+                    path: [String] = [], after: UUID? = nil) throws -> Sticker {
+        var sticker = Sticker(name: Self.cleanName(name), emoji: Self.cleanEmoji(emoji), pixelWidth: encoded.pixelWidth,
                               pixelHeight: encoded.pixelHeight, byteCount: encoded.data.count, format: encoded.format)
         try createDirectoryIfNeeded()
         let url = fileURL(for: sticker)
         try encoded.data.write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
         do {
             try mutate { manifest in
-                // A missing manifest is rebuilt from the PNGs on disk, which already include this one.
+                var parent = folder.flatMap { id in manifest.folders.contains { $0.id == id } ? id : nil }
+                for component in path {
+                    let name = FolderName.clean(component)
+                    guard !name.isEmpty else { continue }
+                    let key = FolderName.key(name)
+                    if let existing = manifest.folders.first(where: { $0.parentID == parent && FolderName.key($0.name) == key }) {
+                        parent = existing.id
+                    } else {
+                        let created = StickerFolder(name: name, parentID: parent)
+                        manifest.folders.append(created)
+                        parent = created.id
+                    }
+                }
+                sticker.folderID = parent
+                // A missing manifest is rebuilt from the image files on disk, which already include this one.
                 manifest.stickers.removeAll { $0.id == sticker.id }
-                manifest.stickers.insert(sticker, at: 0)
+                let index = after.flatMap { id in manifest.stickers.firstIndex { $0.id == id } }.map { $0 + 1 } ?? 0
+                manifest.stickers.insert(sticker, at: index)
             }
         } catch {
             try? FileManager.default.removeItem(at: url)
@@ -212,6 +318,89 @@ public final class StickerStore: Sendable {
         }
     }
 
+    // MARK: Folders
+
+    /// A new folder in `parent` (the top level when nil). A name already used there gets a number (“Cats 2”).
+    @discardableResult
+    public func createFolder(named name: String, in parent: UUID? = nil) throws -> StickerFolder {
+        var folder = StickerFolder(name: FolderName.cleanOrDefault(name), parentID: parent)
+        try mutate { manifest in
+            if let parent, !manifest.folders.contains(where: { $0.id == parent }) { throw StickerStoreError.folderNotFound(parent) }
+            folder.name = FolderName.unique(folder.name, among: manifest.folders.filter { $0.parentID == parent }.map(\.name))
+            manifest.folders.append(folder)
+        }
+        return folder
+    }
+
+    /// Throws `folderNameTaken` if another folder in the same place has the name.
+    public func renameFolder(_ id: UUID, to name: String) throws {
+        let name = FolderName.cleanOrDefault(name)
+        try mutate { manifest in
+            guard let index = manifest.folders.firstIndex(where: { $0.id == id }) else { throw StickerStoreError.folderNotFound(id) }
+            let parent = manifest.folders[index].parentID
+            let key = FolderName.key(name)
+            if manifest.folders.contains(where: { $0.id != id && $0.parentID == parent && FolderName.key($0.name) == key }) {
+                throw StickerStoreError.folderNameTaken(name)
+            }
+            manifest.folders[index].name = name
+        }
+    }
+
+    /// Moves a folder, with everything in it, into `parent` (the top level when nil). A name already used there gets
+    /// a number.
+    public func moveFolder(_ id: UUID, into parent: UUID?) throws {
+        try mutate { manifest in
+            guard let index = manifest.folders.firstIndex(where: { $0.id == id }) else { throw StickerStoreError.folderNotFound(id) }
+            guard manifest.folders[index].parentID != parent else { return }
+            if let parent {
+                guard manifest.folders.contains(where: { $0.id == parent }) else { throw StickerStoreError.folderNotFound(parent) }
+                if StickerLibrary(stickers: [], folders: manifest.folders).subtree(of: id).contains(parent) {
+                    throw StickerStoreError.folderCycle
+                }
+            }
+            let siblings = manifest.folders.filter { $0.parentID == parent && $0.id != id }.map(\.name)
+            manifest.folders[index].name = FolderName.unique(manifest.folders[index].name, among: siblings)
+            manifest.folders[index].parentID = parent
+        }
+    }
+
+    /// Deletes a folder. Keeping its contents moves its stickers and subfolders up to its parent (subfolder names
+    /// already used there get a number); otherwise every folder and sticker inside it is deleted too.
+    public func deleteFolder(_ id: UUID, keepingContents: Bool) throws {
+        var removed: [Sticker] = []
+        try mutate { manifest in
+            guard let folder = manifest.folders.first(where: { $0.id == id }) else { throw StickerStoreError.folderNotFound(id) }
+            if keepingContents {
+                var siblings = manifest.folders.filter { $0.parentID == folder.parentID && $0.id != id }.map(\.name)
+                for index in manifest.folders.indices where manifest.folders[index].parentID == id {
+                    manifest.folders[index].name = FolderName.unique(manifest.folders[index].name, among: siblings)
+                    manifest.folders[index].parentID = folder.parentID
+                    siblings.append(manifest.folders[index].name)
+                }
+                for index in manifest.stickers.indices where manifest.stickers[index].folderID == id {
+                    manifest.stickers[index].folderID = folder.parentID
+                }
+                manifest.folders.removeAll { $0.id == id }
+            } else {
+                let subtree = StickerLibrary(stickers: [], folders: manifest.folders).subtree(of: id)
+                removed = manifest.stickers.filter { $0.folderID.map(subtree.contains) ?? false }
+                manifest.stickers.removeAll { $0.folderID.map(subtree.contains) ?? false }
+                manifest.folders.removeAll { subtree.contains($0.id) }
+            }
+        }
+        for sticker in removed { try? FileManager.default.removeItem(at: fileURL(for: sticker)) }
+    }
+
+    /// Moves stickers into `folder` (the top level when nil), keeping their place in the overall order.
+    public func move(_ ids: Set<UUID>, to folder: UUID?) throws {
+        try mutate { manifest in
+            if let folder, !manifest.folders.contains(where: { $0.id == folder }) { throw StickerStoreError.folderNotFound(folder) }
+            for index in manifest.stickers.indices where ids.contains(manifest.stickers[index].id) {
+                manifest.stickers[index].folderID = folder
+            }
+        }
+    }
+
     /// Starts observing changes made by any process using this store. Keep the returned object alive.
     public func observeChanges(_ handler: @escaping @Sendable () -> Void) -> StickerChangeObserver {
         StickerChangeObserver(name: changeNotificationName, handler: handler)
@@ -219,16 +408,22 @@ public final class StickerStore: Sendable {
 
     // MARK: Private
 
+    /// A coordinated read-modify-write of the manifest (coordination serializes writers across processes), then a
+    /// change notification.
     private func mutate(_ body: (inout StickerManifest) throws -> Void) throws {
         try createDirectoryIfNeeded()
         var result: Result<Void, Error> = .success(())
         var coordinationError: NSError?
         NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: manifestURL, options: [], error: &coordinationError) { url in
             result = Result {
-                var manifest = try loadManifest(at: url)
+                var manifest = try loadManifest(at: url, repairing: true)
+                // Written by a newer build: rewriting it with this build's types would drop what that build added.
+                guard manifest.version <= StickerManifest.currentVersion else { throw StickerStoreError.manifestFromNewerVersion }
                 try body(&manifest)
+                manifest.version = StickerManifest.currentVersion
+                assert(manifest == manifest.normalized(), "a store operation left the manifest inconsistent")
                 let encoder = JSONEncoder()
-                encoder.outputFormatting = [.prettyPrinted, .sortedKeys]
+                encoder.outputFormatting = [.sortedKeys]
                 encoder.dateEncodingStrategy = .iso8601
                 try encoder.encode(manifest).write(to: url, options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
             }
@@ -238,13 +433,29 @@ public final class StickerStore: Sendable {
         StickerChangeObserver.post(name: changeNotificationName)
     }
 
-    /// Reads the manifest. If it is missing or unreadable (an unreadable one is set aside first), the library is rebuilt
-    /// from the PNGs on disk, so a bad write can never strand the user's stickers. No PNGs means an empty library.
-    private func loadManifest(at url: URL) throws -> StickerManifest {
-        if let data = try? Data(contentsOf: url) {
-            let decoder = JSONDecoder()
-            decoder.dateDecodingStrategy = .iso8601
-            if let manifest = try? decoder.decode(StickerManifest.self, from: data) { return manifest }
+    /// Reads the manifest, normalized. A missing one is rebuilt from the image files on disk, so a bad write can never
+    /// strand the user's stickers (no files means an empty library). One that can't be decoded is rebuilt the same
+    /// way, in memory only unless `repairing` (the coordinated writer), which first sets it aside. Any other read error
+    /// is thrown, so a file that exists but can't be read right now is never overwritten with a rebuilt library.
+    /// A manifest from a newer version is never repaired: the writer throws, and readers get what they can read of it.
+    private func loadManifest(at url: URL, repairing: Bool) throws -> StickerManifest {
+        let data: Data
+        do {
+            data = try Data(contentsOf: url)
+        } catch let error as CocoaError where error.code == .fileReadNoSuchFile {
+            return rebuildManifest()
+        }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        if let version = (try? decoder.decode(ManifestVersion.self, from: data))?.version, version > StickerManifest.currentVersion {
+            guard !repairing else { throw StickerStoreError.manifestFromNewerVersion }
+            if let manifest = try? decoder.decode(StickerManifest.self, from: data) { return manifest.normalized() }
+            let lenient = try? decoder.decode(LenientManifest.self, from: data)
+            return StickerManifest(version: version, stickers: lenient?.stickers?.compactMap(\.value) ?? [],
+                                   folders: lenient?.folders?.compactMap(\.value) ?? []).normalized()
+        }
+        if let manifest = try? decoder.decode(StickerManifest.self, from: data) { return manifest.normalized() }
+        if repairing {
             let backup = directory.appendingPathComponent("manifest.corrupt-\(Int(Date().timeIntervalSince1970)).json")
             try? FileManager.default.moveItem(at: url, to: backup)
         }

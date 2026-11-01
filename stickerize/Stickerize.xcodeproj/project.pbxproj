@@ -92,6 +92,11 @@
 			path = Shared;
 			sourceTree = "<group>";
 		};
+		5F8398787EE1B133335EFB3F /* ExtensionUI */ = {
+			isa = PBXFileSystemSynchronizedRootGroup;
+			path = ExtensionUI;
+			sourceTree = "<group>";
+		};
 		4858EE5CFB5DC6D842BA3633 /* MessagesExtension */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
 			path = MessagesExtension;
@@ -165,6 +170,7 @@
 			children = (
 				3ECCD82740D19383DD1C8B8A /* App */,
 				A5A41521C68A91FEFD5C8725 /* Shared */,
+				5F8398787EE1B133335EFB3F /* ExtensionUI */,
 				4858EE5CFB5DC6D842BA3633 /* MessagesExtension */,
 				81D9CE5D6191C6A9D340BAC6 /* KeyboardExtension */,
 				95E4EBEED3F4A24F5414492D /* ShareExtension */,
@@ -247,6 +253,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				4858EE5CFB5DC6D842BA3633 /* MessagesExtension */,
+				5F8398787EE1B133335EFB3F /* ExtensionUI */,
 			);
 			name = StickerizeMessages;
 			packageProductDependencies = (
@@ -270,6 +277,7 @@
 			);
 			fileSystemSynchronizedGroups = (
 				81D9CE5D6191C6A9D340BAC6 /* KeyboardExtension */,
+				5F8398787EE1B133335EFB3F /* ExtensionUI */,
 			);
 			name = StickerizeKeyboard;
 			packageProductDependencies = (

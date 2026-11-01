@@ -61,14 +61,29 @@ public struct AnimatedFrames: Sendable {
 }
 
 public enum AnimatedImageLoader {
-    /// Number of frames: more than 1 for animated GIF, APNG, animated WebP and HEICS; 1 for stills (0 if unreadable).
+    /// Number of frames: more than 1 for animated GIF, APNG, animated WebP, HEICS and AVIS; 1 for stills, including
+    /// files that hold several images that aren't an animation (an icon's sizes in ICO or ICNS, an MPO's stereo pair,
+    /// TIFF pages), whose main image is used; 0 if unreadable.
     public static func frameCount(of data: Data) -> Int {
-        CGImageSourceCreateWithData(data as CFData, nil).map(CGImageSourceGetCount) ?? 0
+        CGImageSourceCreateWithData(data as CFData, nil).map(frameCount(of:)) ?? 0
     }
 
     public static func frameCount(contentsOf url: URL) -> Int {
-        CGImageSourceCreateWithURL(url as CFURL, nil).map(CGImageSourceGetCount) ?? 0
+        CGImageSourceCreateWithURL(url as CFURL, nil).map(frameCount(of:)) ?? 0
     }
+
+    private static func frameCount(of source: CGImageSource) -> Int {
+        let count = CGImageSourceGetCount(source)
+        guard count > 1 else { return count }
+        if let type = CGImageSourceGetType(source).flatMap({ UTType($0 as String) }), animationTypes.contains(where: type.conforms) {
+            return count
+        }
+        // HEIF and AVIF sequences may be typed as plain HEIC or AVIF; their container properties say they're sequences.
+        let properties = CGImageSourceCopyProperties(source, nil) as? [CFString: Any] ?? [:]
+        return properties[kCGImagePropertyHEICSDictionary] != nil || properties[kCGImagePropertyAVISDictionary] != nil ? count : 1
+    }
+
+    private static let animationTypes: [UTType] = [.gif, .png, .webP] + ["public.heics", "public.avis"].compactMap { UTType($0) }
 
     public static func frames(from data: Data, maxPixelSize: Int = StickerSpec.maxPixelDimension,
                               memoryBudget: Int = defaultMemoryBudget) throws -> AnimatedFrames {

@@ -86,16 +86,23 @@ enum StickerActions {
     /// Saves the sticker file to Photos: the PNG with alpha, where "Add Sticker" can put it in the system sticker
     /// library, or the GIF, which Photos keeps animated.
     static func saveToPhotos(_ sticker: Sticker, from store: StickerStore) async throws {
-        let data = try store.data(for: sticker)
+        try await saveToPhotos([sticker], from: store)
+    }
+
+    /// Saves several stickers to Photos in one change, so either all of them are added or none.
+    static func saveToPhotos(_ stickers: [Sticker], from store: StickerStore) async throws {
+        let files = try stickers.map { (sticker: $0, data: try store.data(for: $0)) }
         let status = await PHPhotoLibrary.requestAuthorization(for: .addOnly)
         guard status == .authorized || status == .limited else { throw PhotosAccessError() }
         try await PHPhotoLibrary.shared().performChanges {
-            // Adding the PNG bytes as the photo resource keeps the alpha channel (a UIImage would be re-encoded).
-            let request = PHAssetCreationRequest.forAsset()
-            let options = PHAssetResourceCreationOptions()
-            options.originalFilename = sticker.name + "." + sticker.format.fileExtension
-            options.uniformTypeIdentifier = sticker.format.type.identifier
-            request.addResource(with: .photo, data: data, options: options)
+            for file in files {
+                // Adding the PNG bytes as the photo resource keeps the alpha channel (a UIImage would be re-encoded).
+                let request = PHAssetCreationRequest.forAsset()
+                let options = PHAssetResourceCreationOptions()
+                options.originalFilename = file.sticker.name + "." + file.sticker.format.fileExtension
+                options.uniformTypeIdentifier = file.sticker.format.type.identifier
+                request.addResource(with: .photo, data: file.data, options: options)
+            }
         }
     }
 
