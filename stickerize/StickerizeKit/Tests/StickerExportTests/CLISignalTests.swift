@@ -2,6 +2,8 @@ import Foundation
 import StickerizeKit
 import XCTest
 
+// The CLI is a Mac tool, and Process doesn't exist on iOS, where the app scheme builds these tests too.
+#if os(macOS)
 /// The `stickerize` CLI under signals, run as a separate process: it must stop cleanly (dying of the signal, its
 /// temporary files gone) even when its terminal or stderr is already gone, and keep signals it inherited as ignored.
 final class CLISignalTests: XCTestCase {
@@ -179,3 +181,4 @@ final class CLISignalTests: XCTestCase {
         return try StickerEncoder.pngData(context.makeImage()!)
     }
 }
+#endif

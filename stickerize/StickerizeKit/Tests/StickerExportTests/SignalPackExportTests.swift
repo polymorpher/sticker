@@ -466,6 +466,7 @@ final class SignalPackExportTests: XCTestCase {
         for staging in stagings { XCTAssertFalse(FileManager.default.fileExists(atPath: staging.path), staging.path) }
     }
 
+    #if os(macOS) // Process: the app scheme builds these tests for iOS too.
     /// A run killed outright (or crashed) can't clean up; the next run removes what it left, and only that.
     func testStagingLeftByAKilledRunIsRemovedByTheNext() throws {
         let png = try StickerEncoder.pngData(noise(side: 64, seed: 6))
@@ -490,6 +491,7 @@ final class SignalPackExportTests: XCTestCase {
         XCTAssertTrue(FileManager.default.fileExists(atPath: alive.path), "a run still going")
         XCTAssertTrue(FileManager.default.fileExists(atPath: unmarked.path), "not this tool's")
     }
+    #endif
 
     /// A cancel while converting stops the real run at its next image and removes its staging; one after the point of no
     /// return lets it install and report, keeping the signal for afterwards.
