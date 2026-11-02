@@ -4,7 +4,7 @@ import Foundation
 /// Debug-build launch arguments that drive the real screens, for simulator checks and screenshots where XCUITest
 /// can't run. Compiled out of Release builds.
 ///
-///     xcrun simctl launch booted ai.qokka.stickerize \
+///     xcrun simctl launch booted xyz.hiddenstate.stickerize \
 ///         -StickerizeDebugReset YES -StickerizeDebugImport "/path/a.jpg|/path/b.png" -StickerizeDebugAutoSave YES
 ///
 /// - `-StickerizeDebugReset YES`: delete every sticker first.

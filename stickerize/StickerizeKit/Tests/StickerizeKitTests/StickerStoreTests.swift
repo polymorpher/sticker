@@ -9,7 +9,7 @@ final class StickerStoreTests: XCTestCase {
 
     override func setUp() {
         directory = TestImages.temporaryDirectory().appendingPathComponent("Stickers", isDirectory: true)
-        store = StickerStore(directory: directory, changeNotificationName: "ai.qokka.stickerize.tests.\(UUID().uuidString)")
+        store = StickerStore(directory: directory, changeNotificationName: "xyz.hiddenstate.stickerize.tests.\(UUID().uuidString)")
     }
 
     override func tearDown() {

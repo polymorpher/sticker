@@ -18,6 +18,10 @@ public struct Sticker: Codable, Hashable, Identifiable, Sendable {
     public var folderID: UUID?
 
     public var fileName: String { id.uuidString + "." + format.fileExtension }
+    /// The name a sticker gets when it has none, as in a manifest rebuilt from the image files.
+    public static let placeholderName = "Sticker"
+    /// What a manifest rebuilt from the image files says about a sticker: nothing beyond the default name.
+    var isPlaceholder: Bool { name == Self.placeholderName && emoji == nil && folderID == nil }
     public var isAnimated: Bool { format == .gif }
 
     public init(id: UUID = UUID(), name: String, emoji: String? = nil, createdAt: Date = Date(),
@@ -114,6 +118,19 @@ private struct Lossy<Value: Decodable>: Decodable {
     init(from decoder: Decoder) throws { value = try? Value(from: decoder) }
 }
 
+/// What two stickers must share to be compared as possible duplicates when merging libraries.
+private struct DuplicateKey: Hashable {
+    let folderID: UUID?
+    let name: String
+    let emoji: String?
+
+    init(_ sticker: Sticker) {
+        folderID = sticker.folderID
+        name = sticker.name
+        emoji = sticker.emoji
+    }
+}
+
 /// Just the schema version, read before anything else.
 private struct ManifestVersion: Decodable {
     let version: Int?
@@ -161,7 +178,7 @@ public final class StickerStore: Sendable {
 
     /// Info.plist key whose value is the App Group identifier (filled from the `APP_GROUP` build setting).
     public static let appGroupInfoKey = "StickerizeAppGroup"
-    public static let defaultGroupIdentifier = "group.ai.qokka.stickerize"
+    public static let defaultGroupIdentifier = "group.xyz.hiddenstate.stickerize"
 
     public let location: Location
     public let directory: URL
@@ -401,6 +418,144 @@ public final class StickerStore: Sendable {
         }
     }
 
+    /// What `merge(from:)` did.
+    public struct MergeSummary: Equatable, Sendable {
+        /// Stickers copied in.
+        public var added = 0
+        /// Stickers this library already had under the same ID (the same source merged before).
+        public var alreadyHere = 0
+        /// Stickers left out because one here is identical: the same image, name and emoji, in the same folder.
+        public var duplicates = 0
+        public var foldersAdded = 0
+        /// Source folders that went into a folder already here: the same one, or a same-named one at the same place.
+        public var foldersMatched = 0
+        /// Stickers here that were unnamed placeholders for the source's (see `merge(from:)`) and got its entry back.
+        public var placeholdersFilled = 0
+
+        public init(added: Int = 0, alreadyHere: Int = 0, duplicates: Int = 0, foldersAdded: Int = 0, foldersMatched: Int = 0,
+                    placeholdersFilled: Int = 0) {
+            self.added = added
+            self.alreadyHere = alreadyHere
+            self.duplicates = duplicates
+            self.foldersAdded = foldersAdded
+            self.foldersMatched = foldersMatched
+            self.placeholdersFilled = placeholdersFilled
+        }
+    }
+
+    /// Adds another library's stickers and folders to this one, for moving a library between installs (a different
+    /// bundle ID means a different App Group, which no build can read across).
+    ///
+    /// Stickers keep their ID, name, emoji, date and image file, and the source's order, after this library's own. A
+    /// folder goes into the same-named folder at the same place if there is one, so folders both libraries have combine.
+    /// A sticker counts as already here only if this library's saved manifest lists it and its image is here; otherwise
+    /// the source's image and entry replace whatever a copy that stopped part way left (a missing, partial or leftover
+    /// file, or the placeholder a manifest rebuilt from the files gives it). A placeholder that got saved (named
+    /// "Sticker", no emoji, top level) also takes the source's entry when that one says more: two libraries share a
+    /// sticker ID only when one was copied from the other. Nothing else listed here is removed or renamed.
+    /// Merging the same source again adds nothing new, but brings back what was deleted here since. Throws
+    /// `manifestFromNewerVersion` if either manifest was written by a newer build, which this one would rewrite lossily.
+    @discardableResult
+    public func merge(from source: StickerStore) throws -> MergeSummary {
+        try merge(from: [source])[0]
+    }
+
+    /// Merges several libraries in turn, each as `merge(from:)` does. Merge them in one call: when this library's
+    /// manifest is missing or damaged, the placeholders the first merge saves for images here are then still not taken
+    /// for stickers a later source names.
+    @discardableResult
+    public func merge(from sources: [StickerStore]) throws -> [MergeSummary] {
+        var listed = listedStickerIDs()
+        return try sources.map { source in
+            let (summary, added) = try merge(from: source, listed: listed)
+            listed.formUnion(added)
+            return summary
+        }
+    }
+
+    /// `listed`: the stickers here that count as already here (see `merge(from:)`).
+    private func merge(from source: StickerStore, listed: Set<UUID>) throws -> (MergeSummary, Set<UUID>) {
+        let incoming = try source.loadManifest(at: source.manifestURL, repairing: false)
+        // Also throws, before any file is touched, if the manifest here exists but can't be read right now.
+        let current = try loadManifest(at: manifestURL, repairing: false)
+        guard incoming.version <= StickerManifest.currentVersion, current.version <= StickerManifest.currentVersion else {
+            throw StickerStoreError.manifestFromNewerVersion
+        }
+        let sourceFiles = Set((try? FileManager.default.contentsOfDirectory(atPath: source.directory.path)) ?? [])
+        let stickers = incoming.stickers.filter { sourceFiles.contains($0.fileName) }
+        // Saved placeholders for stickers the source names: e.g. a copy stopped after the images, then the app saved.
+        let placeholders = Set(current.stickers.filter(\.isPlaceholder).map(\.id))
+        let filled = Set(stickers.filter { listed.contains($0.id) && placeholders.contains($0.id) && !$0.isPlaceholder }.map(\.id))
+        let fromSource = Set(stickers.map(\.id)).subtracting(listed).union(filled)
+        // The files first, as `add` does, so the manifest never lists one that isn't there.
+        try createDirectoryIfNeeded()
+        var copied: Set<UUID> = []
+        var added: Set<UUID> = []
+        var written = false
+        defer {
+            // Copied for a sticker that turned out to be a duplicate, or for a merge that failed.
+            for sticker in stickers where copied.contains(sticker.id) && !(written && added.contains(sticker.id)) {
+                try? FileManager.default.removeItem(at: fileURL(for: sticker))
+            }
+        }
+        for sticker in stickers where fromSource.contains(sticker.id) {
+            let image = try source.data(for: sticker)
+            guard (try? data(for: sticker)) != image else { continue }
+            try image.write(to: fileURL(for: sticker), options: [.atomic, .completeFileProtectionUntilFirstUserAuthentication])
+            copied.insert(sticker.id)
+        }
+        var summary = MergeSummary()
+        try mutate { manifest in
+            // Entries here for those stickers are placeholders from a rebuilt manifest, or stale: the source's win.
+            manifest.stickers.removeAll { fromSource.contains($0.id) }
+            var folderFor: [UUID: UUID] = [:]
+            for (folder, _) in StickerLibrary(folders: incoming.folders).outline() {
+                let parent = folder.parentID.flatMap { folderFor[$0] }
+                let key = FolderName.key(folder.name)
+                if let here = manifest.folders.first(where: { $0.id == folder.id })
+                    ?? manifest.folders.first(where: { $0.parentID == parent && FolderName.key($0.name) == key }) {
+                    folderFor[folder.id] = here.id
+                    summary.foldersMatched += 1
+                } else {
+                    manifest.folders.append(StickerFolder(id: folder.id, name: folder.name, parentID: parent))
+                    folderFor[folder.id] = folder.id
+                    summary.foldersAdded += 1
+                }
+            }
+            let ids = Set(manifest.stickers.map(\.id))
+            // Stickers here that could be duplicates (same folder, name and emoji); only their images are then compared.
+            let candidates = Dictionary(grouping: manifest.stickers, by: DuplicateKey.init)
+            for var sticker in stickers {
+                guard !ids.contains(sticker.id) else {
+                    summary.alreadyHere += 1
+                    continue
+                }
+                sticker.folderID = sticker.folderID.flatMap { folderFor[$0] }
+                if let matches = candidates[DuplicateKey(sticker)], let image = try? data(for: sticker),
+                   matches.contains(where: { (try? self.data(for: $0)) == image }) {
+                    summary.duplicates += 1
+                    continue
+                }
+                manifest.stickers.append(sticker)
+                added.insert(sticker.id)
+                if filled.contains(sticker.id) { summary.placeholdersFilled += 1 } else { summary.added += 1 }
+            }
+        }
+        written = true
+        return (summary, added)
+    }
+
+    /// The stickers the manifest as saved lists and has the image of. None when it is missing or can't be decoded: the
+    /// entries of a manifest rebuilt from the files are placeholders, not stickers anyone named.
+    private func listedStickerIDs() -> Set<UUID> {
+        guard let data = try? Data(contentsOf: manifestURL) else { return [] }
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let manifest = try? decoder.decode(StickerManifest.self, from: data) else { return [] }
+        let files = Set((try? FileManager.default.contentsOfDirectory(atPath: directory.path)) ?? [])
+        return Set(manifest.stickers.filter { files.contains($0.fileName) }.map(\.id))
+    }
+
     /// Starts observing changes made by any process using this store. Keep the returned object alive.
     public func observeChanges(_ handler: @escaping @Sendable () -> Void) -> StickerChangeObserver {
         StickerChangeObserver(name: changeNotificationName, handler: handler)
@@ -469,7 +624,7 @@ public final class StickerStore: Sendable {
                   let id = UUID(uuidString: url.deletingPathExtension().lastPathComponent),
                   let size = ImageLoader.orientedPixelSize(contentsOf: url) else { return nil }
             let values = try? url.resourceValues(forKeys: [.creationDateKey, .fileSizeKey])
-            return Sticker(id: id, name: "Sticker", createdAt: values?.creationDate ?? Date(),
+            return Sticker(id: id, name: Sticker.placeholderName, createdAt: values?.creationDate ?? Date(),
                            pixelWidth: Int(size.width), pixelHeight: Int(size.height), byteCount: values?.fileSize ?? 0,
                            format: format)
         }
@@ -482,7 +637,7 @@ public final class StickerStore: Sendable {
 
     static func cleanName(_ name: String) -> String {
         let trimmed = name.trimmingCharacters(in: .whitespacesAndNewlines)
-        return trimmed.isEmpty ? "Sticker" : String(trimmed.prefix(StickerSpec.maxNameLength))
+        return trimmed.isEmpty ? Sticker.placeholderName : String(trimmed.prefix(StickerSpec.maxNameLength))
     }
 
     static func cleanEmoji(_ emoji: String?) -> String? {

@@ -1,6 +1,7 @@
 // stickerize: lift any subjects out of a photo into a sticker-ready transparent PNG, choosing exactly which
 // instances to keep (Photos' "Add Sticker" only takes its main subject). Same pipeline as the iOS app.
-// Also: `stickerize signal-pack <folder or zip>` converts a sticker collection (e.g. WeChat exports) into Signal Desktop packs.
+// Also: `stickerize signal-pack <folder or zip>` converts a sticker collection (e.g. WeChat exports) into Signal Desktop packs,
+// and `stickerize merge-library` combines the app's sticker libraries (scripts/move-library.py uses it).
 
 import CoreGraphics
 import Foundation
@@ -11,6 +12,7 @@ import StickerExport
 let usage = """
 usage: stickerize <image> [options]
        stickerize signal-pack <folder-or-zip> --output <dir> [options]
+       stickerize merge-library <library>... --into <library>
 
 Subject lift (single image):
   --list               list detected instances (id, area %, bbox in image pixels) and exit
@@ -42,6 +44,15 @@ archives inside it are searched too, and files without an extension are recogniz
 Signal requires; one that is too big is reduced to 256 colors, then shrunk and thinned, and kept as a still if it
 still can't fit. Every reduced sticker is listed.
 Upload each pack folder in Signal Desktop: File → Create/upload sticker pack.
+
+Merge libraries (the app's Stickers folder: manifest.json and the image files):
+  --into DIR           required; the library to add to, created if missing
+
+Adds each <library> to DIR in turn, for moving stickers between installs with different bundle IDs (each has its own
+App Group); scripts/move-library.py does it for an iPhone. The libraries given are never written to. Stickers keep
+their names, emoji, dates and order, after DIR's own; folders with the same name at the same place combine; a sticker
+identical to one already in the same folder isn't added twice; merging the same library again adds nothing new, but
+brings back stickers deleted from DIR since.
 """
 
 struct UsageError: Error { let message: String }
@@ -58,6 +69,11 @@ struct Options {
     var maxSize = StickerSpec.maxPixelDimension
     var maxBytes = StickerSpec.maxFileBytes
     var fullSize = false
+}
+
+struct MergeOptions {
+    var sources: [String] = []
+    var into = ""
 }
 
 struct SignalPackOptions {
@@ -153,6 +169,58 @@ func parseSignalPack(_ arguments: [String]) throws -> SignalPackOptions {
     guard !options.outputDirectory.isEmpty else { throw UsageError(message: "--output DIR is required (never writes into the input)") }
     // Where the output may go relative to the input is checked by SignalPackExport.writePacks.
     return options
+}
+
+func parseMerge(_ arguments: [String]) throws -> MergeOptions {
+    var options = MergeOptions()
+    var iterator = arguments.makeIterator()
+    while let argument = iterator.next() {
+        switch argument {
+        case "-h", "--help": print(usage); exit(0)
+        case "--into":
+            guard let value = iterator.next(), !value.hasPrefix("--") else { throw UsageError(message: "--into needs a value") }
+            options.into = value
+        default:
+            if argument.hasPrefix("-") { throw UsageError(message: "unknown option \(argument)") }
+            options.sources.append(argument)
+        }
+    }
+    guard !options.sources.isEmpty else { throw UsageError(message: "missing library to merge") }
+    guard !options.into.isEmpty else { throw UsageError(message: "--into DIR is required") }
+    return options
+}
+
+func runMerge(_ options: MergeOptions) throws {
+    func folder(_ path: String) -> URL {
+        URL(fileURLWithPath: path, isDirectory: true).standardizedFileURL.resolvingSymlinksInPath()
+    }
+    let into = folder(options.into)
+    var sources: [StickerStore] = []
+    for path in options.sources {
+        let source = folder(path)
+        var isDirectory: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: source.path, isDirectory: &isDirectory), isDirectory.boolValue else {
+            throw RunError(errorDescription: "not a folder: \(source.path)")
+        }
+        guard source != into else { throw RunError(errorDescription: "a library can't be merged into itself: \(source.path)") }
+        sources.append(StickerStore(directory: source, changeNotificationName: "xyz.hiddenstate.stickerize.cli.source"))
+    }
+    let store = StickerStore(directory: into, changeNotificationName: "xyz.hiddenstate.stickerize.cli.merge")
+    let summaries: [StickerStore.MergeSummary]
+    do {
+        // In one call, so that a manifest missing in DIR is handled across all of them (see StickerStore.merge(from:)).
+        summaries = try store.merge(from: sources)
+    } catch StickerStoreError.manifestFromNewerVersion {
+        throw RunError(errorDescription: "a library was saved by a newer Stickerize than this tool; update the repository and run it again")
+    }
+    for (path, summary) in zip(options.sources, summaries) {
+        var parts = ["added \(summary.added) sticker(s)"]
+        if summary.duplicates > 0 { parts.append("left out \(summary.duplicates) identical to one already there") }
+        if summary.alreadyHere > 0 { parts.append("\(summary.alreadyHere) were already there") }
+        if summary.placeholdersFilled > 0 { parts.append("gave \(summary.placeholdersFilled) unnamed one(s) there their names back") }
+        parts.append("\(summary.foldersAdded) new folder(s), \(summary.foldersMatched) combined with existing ones")
+        print("\(path): " + parts.joined(separator: "; "))
+    }
 }
 
 let workingMaxPixelSize = 4096
@@ -367,6 +435,8 @@ do {
     let args = Array(CommandLine.arguments.dropFirst())
     if args.first == "signal-pack" {
         try runSignalPack(try parseSignalPack(Array(args.dropFirst())))
+    } else if args.first == "merge-library" {
+        try runMerge(try parseMerge(Array(args.dropFirst())))
     } else {
         try run(try parse(args))
     }

@@ -6,7 +6,7 @@
 //   DEVELOPMENT_TEAM = ABCDE12345
 //   BUNDLE_ID_PREFIX = com.example.stickerize
 
-BUNDLE_ID_PREFIX = ai.qokka.stickerize
+BUNDLE_ID_PREFIX = xyz.hiddenstate.stickerize
 // The App Group the app and its extensions share. Also written into each Info.plist as StickerizeAppGroup,
 // which is what the code reads, so nothing else needs to change if you rename it.
 APP_GROUP = group.$(BUNDLE_ID_PREFIX)

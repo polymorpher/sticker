@@ -28,7 +28,7 @@
 	<array>
 		<dict>
 			<key>UTTypeIdentifier</key>
-			<string>ai.qokka.stickerize.sticker</string>
+			<string>$(BUNDLE_ID_PREFIX).sticker</string>
 			<key>UTTypeDescription</key>
 			<string>Stickerize sticker</string>
 			<key>UTTypeConformsTo</key>

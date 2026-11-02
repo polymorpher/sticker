@@ -48,7 +48,7 @@ Everything lives in `stickerize/`:
 | `ShareExtension/` | "Stickerize" in the share sheet, same editor as the app. |
 | `StickerizeKit/` | Swift package. `StickerizeKit`: storage, decoding, normalization (no Vision, safe for every extension). `StickerLift`: Vision subject lifting and outlines. `StickerExport`: WhatsApp/Telegram payloads (libwebp) and Signal Desktop pack prep (PNG/APNG). `stickerize`: the CLI. Plus tests. |
 | `samples/` | Test photos used by the package tests and the CLI examples. |
-| `scripts/` | `make-icons.swift` (draws every icon), `generate-xcodeproj.py` (how the project file was made). |
+| `scripts/` | `make-icons.swift` (draws every icon), `generate-xcodeproj.py` (how the project file was made), `move-library.py` (moves stickers from builds with another bundle ID, see below). |
 
 The package isn't called `StickerKit` because Apple ships an empty system module with that name in the device and
 macOS SDKs (but not the simulator SDK). A shadowing module would fail differently on device and in the simulator.
@@ -67,7 +67,7 @@ open stickerize/Stickerize.xcodeproj
 library (the app then shows a warning).
 
 **Device:** put your team in `stickerize/Config/Local.xcconfig` (git-ignored), and change the bundle ID prefix if
-`ai.qokka.stickerize` isn't yours:
+`xyz.hiddenstate.stickerize` isn't yours:
 
 ```
 DEVELOPMENT_TEAM = ABCDE12345
@@ -75,7 +75,31 @@ BUNDLE_ID_PREFIX = com.example.stickerize
 ```
 
 The App Group is derived from the prefix (`group.<prefix>`), written into every target's entitlements and Info.plist,
-and registered by automatic signing (`REGISTER_APP_GROUPS`). Nothing else needs editing.
+and registered by automatic signing (`REGISTER_APP_GROUPS`). Nothing else needs editing. Signing certificates and
+their private keys stay in your keychain, where automatic signing finds them; nothing about signing is committed, and
+`.gitignore` also keeps keys (`.p12`, `.p8`, `.pem`, `.key`) and provisioning profiles out.
+
+**Moving stickers to a new bundle ID:** each prefix has its own App Group, so a build with a new prefix starts with an
+empty library while the old app keeps its stickers (deleting that app deletes them). With the phone connected:
+
+```bash
+stickerize/scripts/move-library.py --backup-only   # first, before installing anything: copies every library to the Mac
+stickerize/scripts/move-library.py --dry-run       # after installing the new build from the Mac; the phone isn't written to
+stickerize/scripts/move-library.py
+```
+
+It finds every Stickerize build on the phone (named Stickerize, or with "stickerize" in its bundle ID), copies their
+libraries to `~/Stickerize Backups/`, merges them into the new app's with `stickerize merge-library` (stickers keep their
+names, emoji and folders; folders with the same name combine; a sticker identical to one already there isn't doubled),
+copies the result to the phone and reads every file back. It then prints a `devicectl device uninstall app` command for
+each old build: delete them that way, by bundle ID, since every build looks the same on the Home Screen. Running it
+again before then adds nothing new, but brings back stickers you deleted in the new app since. `devicectl` can only read
+the data of apps installed from a Mac.
+
+iOS installs over an app only if both are signed by the same team. If a build with the new bundle ID is already on the
+phone from another team, the install fails; don't delete that build to get past it before `--backup-only` has copied its
+library. After deleting it and installing the new build, merge its backup in with
+`--add-library "<backup folder>/group.<bundle ID>/Stickers"`.
 
 **Tests:**
 
@@ -83,8 +107,8 @@ and registered by automatic signing (`REGISTER_APP_GROUPS`). Nothing else needs 
 cd stickerize/StickerizeKit && swift test
 ```
 
-228 tests cover decoding, orientation, normalization limits, animated GIFs, naming, the store and its folders (damaged
-and newer manifests included), search, Vision lifting on the samples, outlines, the WebP/pack payloads, Signal packs
+241 tests cover decoding, orientation, normalization limits, animated GIFs, naming, the store and its folders (damaged
+and newer manifests included), merging libraries, search, Vision lifting on the samples, outlines, the WebP/pack payloads, Signal packs
 (checked against what Signal's sticker creator accepts) and ZIP archives (damaged, encrypted and hostile ones included,
 name decoding measured on generated names, and how their folders become sticker folders). Vision tests run on the Mac only: Vision's instance masks don't run in the iOS Simulator.
 The scheme's Test action runs the same package tests plus the UI tests in the simulator.
@@ -195,6 +219,8 @@ swift run stickerize ../samples/test3.jpg --include 1 --outline 12 --output pers
 
 Run `stickerize --help` for the options. The output meets the iMessage limits unless you pass `--full-size`. Logs go
 to stderr and the output path to stdout. Exit codes: 1 error, 2 usage, 3 no subject found.
+`stickerize merge-library <library>... --into <library>` combines the app's Stickers folders (what
+`scripts/move-library.py` uses).
 
 ### Signal packs from a folder (WeChat → Signal)
 
@@ -218,6 +244,10 @@ swift run -c release stickerize signal-pack ~/Downloads/表情包.zip --output ~
 
 ## Known limits
 
+- `scripts/move-library.py` was tried on a simulator, where `devicectl` can't copy files, so its copies to and from a
+  phone are untested. It reads back and compares every file it writes, writes the library file last, and stops without
+  writing when a copy fails or the new app's library changed meanwhile; the old apps keep their stickers until you
+  delete them.
 - In the simulator, background removal is unavailable (the editor says so and uses the whole image). Test it on a device.
 - Declaring the media context means the iMessage app lives in the Stickers drawer rather than the Messages app list.
 - The keyboard is a sticker picker with no typing keys. App Review guideline 4.4.1 asks keyboards to provide typed

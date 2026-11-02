@@ -8,8 +8,9 @@ import UniformTypeIdentifiers
 
 extension UTType {
     /// Marks drags that start in Stickerize, so dropping a tile back on the library doesn't import a duplicate.
-    /// Declared in App-Info.plist (UTExportedTypeDeclarations).
-    static let stickerizeSticker = UTType(exportedAs: "ai.qokka.stickerize.sticker", conformingTo: .data)
+    /// Declared in App-Info.plist (UTExportedTypeDeclarations) as `$(BUNDLE_ID_PREFIX).sticker`, the app's bundle ID.
+    static let stickerizeSticker = UTType(exportedAs: (Bundle.main.bundleIdentifier ?? "xyz.hiddenstate.stickerize") + ".sticker",
+                                          conformingTo: .data)
 }
 
 /// A still sticker as a shareable PNG (share sheet, drag and drop). Uses the ≤ 512 px pasteboard copy, which other

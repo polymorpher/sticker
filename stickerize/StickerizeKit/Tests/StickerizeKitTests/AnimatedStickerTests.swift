@@ -107,7 +107,7 @@ final class AnimatedStickerTests: XCTestCase {
 
     func testStoreSavesGIFStickersAndCopiesThemAsGIF() throws {
         let directory = TestImages.temporaryDirectory().appendingPathComponent("Stickers", isDirectory: true)
-        let store = StickerStore(directory: directory, changeNotificationName: "ai.qokka.stickerize.tests.\(UUID().uuidString)")
+        let store = StickerStore(directory: directory, changeNotificationName: "xyz.hiddenstate.stickerize.tests.\(UUID().uuidString)")
         let encoded = try AnimatedStickerEncoder.encode(bouncingSquare(count: 6))
         let sticker = try store.add(encoded, name: "Bounce")
         XCTAssertTrue(sticker.isAnimated)

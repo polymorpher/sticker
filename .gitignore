@@ -14,3 +14,11 @@ CLAUDE.md
 AGENTS.md
 # Original tool, binary and its outputs, kept locally for reference
 stickerize/legacy/
+# Signing material: private keys, App Store Connect API keys and provisioning profiles stay off the repo
+*.p12
+*.p8
+*.pem
+*.key
+*.mobileprovision
+*.provisionprofile
+__pycache__/
