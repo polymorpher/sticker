@@ -80,7 +80,14 @@ their private keys stay in your keychain, where automatic signing finds them; no
 `.gitignore` also keeps keys (`.p12`, `.p8`, `.pem`, `.key`) and provisioning profiles out.
 
 **Moving stickers to a new bundle ID:** each prefix has its own App Group, so a build with a new prefix starts with an
-empty library while the old app keeps its stickers (deleting that app deletes them). With the phone connected:
+empty library while the old app keeps its stickers (deleting that app deletes them). The library lives in the App
+Group's `Library/Application Support/Stickers`: `devicectl`, which the move uses, may only read and write a container's
+`Library`, `Documents` and `SystemData` folders. Builds from before that kept it at the group's top level, out of its
+reach. For such an app, first install a build of this repository over it with the same bundle ID and team (set
+`BUNDLE_ID_PREFIX` and `DEVELOPMENT_TEAM` in `Local.xcconfig` for that one build; iOS keeps the data of an update from the
+same team) and open it once: it moves the library into place. An older build that shares the App Group keeps saving to
+the old place; a build of this repository merges that in whenever it starts, so open it again before moving if you used
+the older one meanwhile. Then, with the phone connected:
 
 ```bash
 stickerize/scripts/move-library.py --backup-only   # first, before installing anything: copies every library to the Mac
@@ -92,7 +99,8 @@ It finds every Stickerize build on the phone (named Stickerize, or with "sticker
 libraries to `~/Stickerize Backups/`, merges them into the new app's with `stickerize merge-library` (stickers keep their
 names, emoji and folders; folders with the same name combine; a sticker identical to one already there isn't doubled),
 copies the result to the phone and reads every file back. It then prints a `devicectl device uninstall app` command for
-each old build: delete them that way, by bundle ID, since every build looks the same on the Home Screen. Running it
+each old build whose library it moved: delete them that way, by bundle ID, since every build looks the same on the Home
+Screen. A build whose App Group showed no library it could reach gets a note instead, and isn't listed. Running it
 again before then adds nothing new, but brings back stickers you deleted in the new app since. `devicectl` can only read
 the data of apps installed from a Mac.
 
@@ -107,8 +115,8 @@ library. After deleting it and installing the new build, merge its backup in wit
 cd stickerize/StickerizeKit && swift test
 ```
 
-241 tests cover decoding, orientation, normalization limits, animated GIFs, naming, the store and its folders (damaged
-and newer manifests included), merging libraries, search, Vision lifting on the samples, outlines, the WebP/pack payloads, Signal packs
+246 tests cover decoding, orientation, normalization limits, animated GIFs, naming, the store and its folders (damaged
+and newer manifests included), where it lives and the move there from older builds, merging libraries, search, Vision lifting on the samples, outlines, the WebP/pack payloads, Signal packs
 (checked against what Signal's sticker creator accepts) and ZIP archives (damaged, encrypted and hostile ones included,
 name decoding measured on generated names, and how their folders become sticker folders). Vision tests run on the Mac only: Vision's instance masks don't run in the iOS Simulator.
 The scheme's Test action runs the same package tests plus the UI tests in the simulator.
@@ -219,7 +227,7 @@ swift run stickerize ../samples/test3.jpg --include 1 --outline 12 --output pers
 
 Run `stickerize --help` for the options. The output meets the iMessage limits unless you pass `--full-size`. Logs go
 to stderr and the output path to stdout. Exit codes: 1 error, 2 usage, 3 no subject found.
-`stickerize merge-library <library>... --into <library>` combines the app's Stickers folders (what
+`stickerize merge-library <library>... --into <library>` combines the app's library folders (what
 `scripts/move-library.py` uses).
 
 ### Signal packs from a folder (WeChat → Signal)
@@ -244,10 +252,10 @@ swift run -c release stickerize signal-pack ~/Downloads/表情包.zip --output ~
 
 ## Known limits
 
-- `scripts/move-library.py` was tried on a simulator, where `devicectl` can't copy files, so its copies to and from a
-  phone are untested. It reads back and compares every file it writes, writes the library file last, and stops without
-  writing when a copy fails or the new app's library changed meanwhile; the old apps keep their stickers until you
-  delete them.
+- `scripts/move-library.py` was tried on simulators (where `devicectl` can't copy files) and with a stand-in
+  `devicectl` that applies a phone's folder rules, not yet on a phone. It reads back and compares every file it writes,
+  writes the library file last, and stops without writing when a copy fails or the new app's library changed meanwhile;
+  the old apps keep their stickers until you delete them.
 - In the simulator, background removal is unavailable (the editor says so and uses the whole image). Test it on a device.
 - Declaring the media context means the iMessage app lives in the Stickers drawer rather than the Messages app list.
 - The keyboard is a sticker picker with no typing keys. App Review guideline 4.4.1 asks keyboards to provide typed

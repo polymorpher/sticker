@@ -2,10 +2,13 @@
 """Moves sticker libraries from other Stickerize builds on an iPhone into the build with this repository's bundle ID.
 
 An app can only read its own App Group, so stickers saved by a build with another bundle ID (one built with an
-earlier BUNDLE_ID_PREFIX) are invisible to the new one. With the phone
-connected to this Mac:
+earlier BUNDLE_ID_PREFIX) are invisible to the new one. devicectl, which copies them, may only reach a container's
+Library, Documents and SystemData folders, so the library has to be in Library/Application Support/Stickers. Builds
+from before that kept it at the group's top level: first install a build of this repository over such an app (the same
+bundle ID and DEVELOPMENT_TEAM, set in Config/Local.xcconfig, so its data stays) and open it once to move the library.
+Then, with the phone connected to this Mac:
 
-    scripts/move-library.py --backup-only   # first: copies every Stickerize library to this Mac and lists the apps
+    scripts/move-library.py --backup-only   # copies every Stickerize library to this Mac and lists the apps
     # install the new build from this Mac, then:
     scripts/move-library.py --dry-run       # back up and merge on this Mac only; nothing on the phone is written
     scripts/move-library.py                 # the real run
@@ -13,8 +16,8 @@ connected to this Mac:
 If an old build has to be deleted before the new one installs (the same bundle ID signed by another team), merge its
 backup in with --add-library "<backup>/<its App Group>/Stickers".
 
-1. Lists the apps on the phone whose bundle ID contains "stickerize", and their App Groups.
-2. Copies each group's Stickers folder to ~/Stickerize Backups/<date>/ (only reading the phone).
+1. Lists the Stickerize builds on the phone (named Stickerize, or with "stickerize" in the bundle ID) and their groups.
+2. Copies each group's library to ~/Stickerize Backups/<date>/ (only reading the phone).
 3. Merges them with `stickerize merge-library`: the new app's own library, then the others, most recently used first.
    Folders with the same name at the same place combine; a sticker identical to one already there isn't doubled.
 4. Copies the result into the new app's group, then reads it back and compares every file.
@@ -40,6 +43,9 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KIT = ROOT / "StickerizeKit"
 IMAGE_SUFFIXES = (".png", ".gif")
+# Where the app keeps its library in an App Group (StickerStore.libraryDirectory): devicectl may only reach the Library,
+# Documents and SystemData folders of a container. Builds before kept it at the top level, which devicectl refuses.
+LIBRARY_PATH = "Library/Application Support/Stickers"
 # The files of a library, as named in the app's Stickers folder.
 LIBRARY_FILE = re.compile(r"manifest\.json|[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}\.(png|gif)", re.I)
 FILE_LIKE = re.compile(r"\.(png|gif|jpe?g|heic|webp|json|plist)$", re.I)
@@ -144,30 +150,30 @@ class Device:
                          "--domain-identifier", group, *options)
 
     def pull(self, group, destination):
-        """Copies the library files in the group's Stickers folder into `destination` (a new folder), one at a time from
-        the folder's listing: devicectl copies files, not folders. False if the group has no Stickers folder."""
+        """Copies the library files in the group's library folder into `destination` (a new folder), one at a time from
+        the folder's listing: devicectl copies files, not folders. False if the group has no library folder."""
         try:
-            listing = self._list(group, "--subdirectory", "Stickers")
+            listing = self._list(group, "--subdirectory", LIBRARY_PATH)
         except Failure as error:
-            # Only a group seen to have no Stickers folder has no library. Any other failure (the phone dropping off
+            # Only a group seen to have no library folder has no library. Any other failure (the phone dropping off
             # for a moment, say) stops the run rather than leave a library out.
-            root = self._list(group, "--no-recurse")
-            self.listings[group] = {"Stickers": str(error), "group": root}
-            if "Stickers" in names_in(root):
-                raise Failure(f"{group} has a Stickers folder that couldn't be listed: {error}")
+            root = self._list(group)
+            self.listings[group] = {LIBRARY_PATH: str(error), "group": root}
+            if any(text.strip("/") == LIBRARY_PATH for text in strings_in(root)):
+                raise Failure(f"{group} has a library folder that couldn't be listed: {error}")
             return False
-        self.listings[group] = {"Stickers": listing}
+        self.listings[group] = {LIBRARY_PATH: listing}
         names = names_in(listing)
         files = sorted(name for name in names if LIBRARY_FILE.fullmatch(name))
         if not files and any(FILE_LIKE.search(name) for name in names):
             # Never taken for an empty library: that could hide the stickers it has.
-            raise Failure(f"{group}'s Stickers folder lists files this doesn't recognize; nothing was written")
+            raise Failure(f"{group}'s library folder lists files this doesn't recognize; nothing was written")
         destination.mkdir(parents=True)
         for index, name in enumerate(files, 1):
             if index % 50 == 0:
                 print(f"    {index} of {len(files)} files")
             path = destination / name
-            self._copy_from(group, f"Stickers/{name}", path)
+            self._copy_from(group, f"{LIBRARY_PATH}/{name}", path)
             if path.is_dir() and (path / name).is_file():
                 # Copied into a folder of that name rather than to it.
                 held = path.with_name(name + ".copying")
@@ -175,7 +181,7 @@ class Device:
                 (held / name).rename(path)
                 held.rmdir()
             if not path.is_file():
-                raise Failure(f"Copying {group}'s Stickers/{name} left no file at {path}")
+                raise Failure(f"Copying {group}'s {LIBRARY_PATH}/{name} left no file at {path}")
         return True
 
     def _copy_to(self, group, paths, destination):
@@ -184,19 +190,19 @@ class Device:
                   "--domain-identifier", group, *sources, "--destination", destination)
 
     def push(self, group, files):
-        """Copies `files` into the group's Stickers folder, in batches, in the order given."""
+        """Copies `files` into the group's library folder, in batches, in the order given."""
         for start in range(0, len(files), 50):
             batch = files[start:start + 50]
             if len(batch) == 1:
                 # One source is copied to the destination path itself, so name the file (a folder would be replaced).
-                self._copy_to(group, batch, f"Stickers/{batch[0].name}")
+                self._copy_to(group, batch, f"{LIBRARY_PATH}/{batch[0].name}")
                 continue
             try:
-                self._copy_to(group, batch, "Stickers")
+                self._copy_to(group, batch, LIBRARY_PATH)
             except Failure:
-                # E.g. no Stickers folder yet for several files to go into: one at a time, each to its own path.
+                # E.g. no library folder yet for several files to go into: one at a time, each to its own path.
                 for path in batch:
-                    self._copy_to(group, [path], f"Stickers/{path.name}")
+                    self._copy_to(group, [path], f"{LIBRARY_PATH}/{path.name}")
 
 
 class Simulator:
@@ -215,7 +221,7 @@ class Simulator:
                 self.groups[group.strip()] = pathlib.Path(path.strip())
 
     def pull(self, group, destination):
-        source = self.groups[group] / "Stickers"
+        source = self.groups[group] / LIBRARY_PATH
         if not source.is_dir():
             return False
         destination.mkdir(parents=True)
@@ -224,7 +230,7 @@ class Simulator:
         return True
 
     def push(self, group, files):
-        target = self.groups[group] / "Stickers"
+        target = self.groups[group] / LIBRARY_PATH
         target.mkdir(parents=True, exist_ok=True)
         for path in files:
             shutil.copy2(path, target / path.name)
@@ -275,10 +281,21 @@ def save_listings(device, backups):
     (backups / "devicectl-listings.json").write_text(json.dumps(device.listings, indent=1, default=str))
 
 
+def warn_unreachable(groups, apps):
+    """A group with no library this can reach may still have one where builds from before kept it."""
+    for group in groups:
+        names = ", ".join(a["bundleIdentifier"] for a in apps if group in (a.get("appGroupIdentifiers") or []))
+        print(f"  Note: {group} ({names}) has no library this can reach. If those apps have stickers, they are where builds "
+              f"from before the library moved kept them: install this repository's code over one of them (same bundle ID "
+              f"and DEVELOPMENT_TEAM), open it once, and run this again. They aren't listed for deletion.")
+
+
 def nothing_found(groups, backups):
-    return Failure(f"No sticker library found in {', '.join(groups)}. If Stickerize shows stickers on the phone, they are "
-                   f"somewhere this can't see: don't delete anything. Run this again with --verbose, and send the output "
-                   f"and {backups / 'devicectl-listings.json'}.")
+    return Failure(f"No sticker library found in {', '.join(groups)}. Don't delete anything. Builds from before the library "
+                   f"moved to {LIBRARY_PATH} keep it where devicectl can't reach: install a build of this repository over "
+                   f"that app (same bundle ID and DEVELOPMENT_TEAM, so its data stays), open it once so it moves the library, "
+                   f"and run this again. If that's not it, run with --verbose and send the output and "
+                   f"{backups / 'devicectl-listings.json'}.")
 
 
 def backup(device, group, backups):
@@ -345,6 +362,8 @@ def main():
             save_listings(device, backups)
         if groups and not copied:
             raise nothing_found(groups, backups)
+        new_app_groups = (by_id.get(target_id) or {}).get("appGroupIdentifiers") or []
+        warn_unreachable([g for g in groups if g not in copied and g not in new_app_groups], apps)
         print(f"Backed up {len(copied)} librar{'y' if len(copied) == 1 else 'ies'}. Nothing on the phone was changed.")
         return
     target = by_id.get(target_id)
@@ -390,8 +409,13 @@ def main():
                   f"the other apps get their names back). The damaged file is kept in {pulled[target_group]}.")
     if target_group not in pulled:
         # The new app has never saved a sticker. A copy that failed for another reason must not be taken for that, or the
-        # merged manifest would hide the stickers it has.
+        # merged manifest would hide the stickers it has. (One left at the top level by an older build of it is merged in
+        # by the app when it next starts: StickerStore.libraryDirectory.)
         print(f"  ({target_id} has no library yet: its stickers start empty)")
+    unreached = [g for g in source_groups if g not in pulled]
+    warn_unreachable(unreached, source_apps)
+    # Only apps whose every group was backed up and merged can go.
+    deletable = [a for a in source_apps if not set(a.get("appGroupIdentifiers") or []) & set(unreached)]
 
     merged = backups / "merged" / "Stickers"
     merged.mkdir(parents=True)
@@ -446,8 +470,9 @@ def main():
     verify(list(after))
     print(f"Done: {target_id} has {sticker_count(merged)} sticker(s). Every file was read back and checked.")
     print(f"Backups: {backups}")
-    print("Open it to check. Then delete the old apps by bundle ID (every build looks the same on the Home Screen):")
-    for app in source_apps:
+    if deletable:
+        print("Open it to check. Then delete the old apps by bundle ID (every build looks the same on the Home Screen):")
+    for app in deletable:
         print(f"  xcrun devicectl device uninstall app --device {device.identifier} {app['bundleIdentifier']}")
 
 

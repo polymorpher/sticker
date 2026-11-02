@@ -165,9 +165,9 @@ public enum StickerStoreError: LocalizedError, Equatable {
 
 /// Sticker library shared by the app and its extensions.
 ///
-/// Layout: `<container>/Stickers/<uuid>.png` plus `<container>/Stickers/manifest.json`. The container is the App Group
-/// when the entitlement is present, otherwise the process's own Application Support directory (so the app still works,
-/// but the extensions see their own empty library). Every mutation is a coordinated read-modify-write of the manifest
+/// Layout: `<uuid>.png` (or `.gif`) files plus `manifest.json`, in `Library/Application Support/Stickers` of the App Group
+/// container when the entitlement is present (see `libraryDirectory(inGroupContainer:changeNotificationName:)`), otherwise in `Stickers` in the
+/// process's own Application Support directory (so the app still works, but the extensions see their own empty library). Every mutation is a coordinated read-modify-write of the manifest
 /// followed by a Darwin notification, so other processes can reload.
 public final class StickerStore: Sendable {
     public enum Location: Sendable, Equatable {
@@ -195,14 +195,55 @@ public final class StickerStore: Sendable {
         let fileManager = FileManager.default
         if let appGroupIdentifier,
            let container = fileManager.containerURL(forSecurityApplicationGroupIdentifier: appGroupIdentifier) {
-            self.init(directory: container.appendingPathComponent("Stickers", isDirectory: true),
-                      location: .appGroup(appGroupIdentifier),
-                      changeNotificationName: "\(appGroupIdentifier).stickers-changed")
+            let changeNotificationName = "\(appGroupIdentifier).stickers-changed"
+            self.init(directory: Self.libraryDirectory(inGroupContainer: container, changeNotificationName: changeNotificationName),
+                      location: .appGroup(appGroupIdentifier), changeNotificationName: changeNotificationName)
         } else {
             let support = fileManager.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
             self.init(directory: support.appendingPathComponent("Stickers", isDirectory: true),
                       location: .local,
                       changeNotificationName: "\(appGroupIdentifier ?? Self.defaultGroupIdentifier).local-stickers-changed")
+        }
+    }
+
+    /// Where the library lives in an App Group container: `Library/Application Support/Stickers`. Xcode's devicectl may
+    /// only read and write an app's Library, Documents and SystemData folders, so a library there can be backed up from a
+    /// Mac and moved between builds (scripts/move-library.py). Builds before this kept it at the container's top level,
+    /// in `Stickers`; the first process that can write moves it here, in one rename coordinated with other processes'
+    /// writes. One that can't (a keyboard without Full Access) reads it where it is.
+    ///
+    /// An older build sharing the App Group still saves to the top level after the move. Then a process that can write
+    /// merges what is there into the library (`merge(from:)`) and moves that folder aside, next to the library, where
+    /// devicectl can still reach it and it isn't merged again. `changeNotificationName` tells other processes.
+    public static func libraryDirectory(inGroupContainer container: URL, changeNotificationName: String) -> URL {
+        let fileManager = FileManager.default
+        let current = container.appendingPathComponent("Library/Application Support/Stickers", isDirectory: true)
+        let legacy = container.appendingPathComponent("Stickers", isDirectory: true)
+        guard fileManager.fileExists(atPath: legacy.path) else { return current }
+        if fileManager.fileExists(atPath: current.path) {
+            let library = StickerStore(directory: current, location: .local, changeNotificationName: changeNotificationName)
+            let source = StickerStore(directory: legacy, location: .local, changeNotificationName: changeNotificationName)
+            if (try? library.merge(from: source)) != nil {
+                let aside = current.deletingLastPathComponent()
+                    .appendingPathComponent("Stickers saved by an older build \(Int(Date().timeIntervalSince1970))", isDirectory: true)
+                move(legacy, to: aside)
+            }
+            return current
+        }
+        move(legacy, to: current)
+        return fileManager.fileExists(atPath: current.path) ? current : legacy
+    }
+
+    /// Renames a folder, coordinated with other processes' writes in it. Does nothing if it can't, or if another process
+    /// moved it meanwhile.
+    private static func move(_ folder: URL, to destination: URL) {
+        let fileManager = FileManager.default
+        var coordinationError: NSError?
+        NSFileCoordinator(filePresenter: nil).coordinate(writingItemAt: folder, options: .forMoving, writingItemAt: destination,
+                                                         options: .forReplacing, error: &coordinationError) { from, to in
+            guard !fileManager.fileExists(atPath: to.path), fileManager.fileExists(atPath: from.path) else { return }
+            try? fileManager.createDirectory(at: to.deletingLastPathComponent(), withIntermediateDirectories: true)
+            try? fileManager.moveItem(at: from, to: to)
         }
     }
 
