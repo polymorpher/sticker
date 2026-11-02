@@ -40,6 +40,10 @@ import tempfile
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 KIT = ROOT / "StickerizeKit"
 IMAGE_SUFFIXES = (".png", ".gif")
+# The files of a library, as named in the app's Stickers folder.
+LIBRARY_FILE = re.compile(r"manifest\.json|[0-9A-F]{8}-([0-9A-F]{4}-){3}[0-9A-F]{12}\.(png|gif)", re.I)
+FILE_LIKE = re.compile(r"\.(png|gif|jpe?g|heic|webp|json|plist)$", re.I)
+VERBOSE = False
 
 
 class Failure(Exception):
@@ -70,6 +74,8 @@ def devicectl(*args):
     """`xcrun devicectl` with JSON output; returns its "result"."""
     with tempfile.TemporaryDirectory() as tmp:
         output = pathlib.Path(tmp) / "result.json"
+        if VERBOSE:
+            print("    $ xcrun devicectl " + " ".join(args), file=sys.stderr)
         process = run(["xcrun", "devicectl", *args, "--quiet", "--json-output", str(output)])
         result = json.loads(output.read_text()) if output.exists() and output.stat().st_size else {}
         if process.returncode != 0:
@@ -87,6 +93,11 @@ def strings_in(value):
             yield from strings_in(item)
     elif isinstance(value, str):
         yield value
+
+
+def names_in(listing):
+    """The last path component of every string in a devicectl file listing, whose format isn't documented."""
+    return {text.rstrip("/").rsplit("/", 1)[-1] for text in strings_in(listing)}
 
 
 def library_files(folder):
@@ -121,40 +132,51 @@ class Device:
 
     def __init__(self, identifier, name):
         self.identifier, self.name = identifier, name
+        # What devicectl listed for each group, kept in the backup folder to look at if something's off.
+        self.listings = {}
 
     def _copy_from(self, group, source, destination):
         devicectl("device", "copy", "from", "--device", self.identifier, "--domain-type", "appGroupDataContainer",
                   "--domain-identifier", group, "--source", source, "--destination", str(destination))
 
+    def _list(self, group, *options):
+        return devicectl("device", "info", "files", "--device", self.identifier, "--domain-type", "appGroupDataContainer",
+                         "--domain-identifier", group, *options)
+
     def pull(self, group, destination):
-        """Copies the group's Stickers folder into `destination` (a new folder); False if the group has none."""
-        with tempfile.TemporaryDirectory() as tmp:
-            landing = pathlib.Path(tmp) / "pull"
-            try:
-                self._copy_from(group, "Stickers", landing)
-            except Failure as error:
-                # Only a group seen to have no Stickers folder has no library. Any other failure (the phone dropping off
-                # for a moment, say) stops the run rather than leave a library out.
-                try:
-                    listing = devicectl("device", "info", "files", "--device", self.identifier, "--domain-type",
-                                        "appGroupDataContainer", "--domain-identifier", group, "--no-recurse")
-                except Failure:
-                    raise error
-                if any(text.rstrip("/").rsplit("/", 1)[-1] == "Stickers" for text in strings_in(listing)):
-                    raise error
-                return False
-            # Wherever the copy put the folder's contents: the landing folder itself, or a folder inside it.
-            found = next((f for f in (landing, landing / "Stickers") if library_files(f)), None)
-            if not found:
-                manifests = sorted(landing.rglob("manifest.json")) if landing.exists() else []
-                found = manifests[0].parent if manifests else None
-            if not found and (landing.is_file() or landing.exists() and any(p.is_file() for p in landing.rglob("*"))):
-                # Never taken for an empty library: that could hide the stickers it has.
-                raise Failure(f"The copy of {group}'s Stickers folder came back in an unexpected layout; nothing was written")
-            destination.mkdir(parents=True)
-            for path in library_files(found) if found else []:
-                shutil.copy2(path, destination / path.name)
-            return True
+        """Copies the library files in the group's Stickers folder into `destination` (a new folder), one at a time from
+        the folder's listing: devicectl copies files, not folders. False if the group has no Stickers folder."""
+        try:
+            listing = self._list(group, "--subdirectory", "Stickers")
+        except Failure as error:
+            # Only a group seen to have no Stickers folder has no library. Any other failure (the phone dropping off
+            # for a moment, say) stops the run rather than leave a library out.
+            root = self._list(group, "--no-recurse")
+            self.listings[group] = {"Stickers": str(error), "group": root}
+            if "Stickers" in names_in(root):
+                raise Failure(f"{group} has a Stickers folder that couldn't be listed: {error}")
+            return False
+        self.listings[group] = {"Stickers": listing}
+        names = names_in(listing)
+        files = sorted(name for name in names if LIBRARY_FILE.fullmatch(name))
+        if not files and any(FILE_LIKE.search(name) for name in names):
+            # Never taken for an empty library: that could hide the stickers it has.
+            raise Failure(f"{group}'s Stickers folder lists files this doesn't recognize; nothing was written")
+        destination.mkdir(parents=True)
+        for index, name in enumerate(files, 1):
+            if index % 50 == 0:
+                print(f"    {index} of {len(files)} files")
+            path = destination / name
+            self._copy_from(group, f"Stickers/{name}", path)
+            if path.is_dir() and (path / name).is_file():
+                # Copied into a folder of that name rather than to it.
+                held = path.with_name(name + ".copying")
+                path.rename(held)
+                (held / name).rename(path)
+                held.rmdir()
+            if not path.is_file():
+                raise Failure(f"Copying {group}'s Stickers/{name} left no file at {path}")
+        return True
 
     def _copy_to(self, group, paths, destination):
         sources = [arg for path in paths for arg in ("--source", str(path))]
@@ -183,6 +205,7 @@ class Simulator:
     def __init__(self, identifier, name):
         self.identifier, self.name = identifier, name
         self.groups = {}
+        self.listings = {}
 
     def note_app(self, bundle_id):
         process = run(["xcrun", "simctl", "get_app_container", self.identifier, bundle_id, "groups"])
@@ -243,8 +266,19 @@ def backup_folder(args):
     backups = args.backup_dir or pathlib.Path.home() / "Stickerize Backups" / datetime.datetime.now().strftime("%Y-%m-%d %H.%M.%S")
     if backups.exists() and any(backups.iterdir()):
         raise Failure(f"{backups} isn't empty; pass another --backup-dir")
+    backups.mkdir(parents=True, exist_ok=True)
     print(f"Backing up to {backups}")
     return backups
+
+
+def save_listings(device, backups):
+    (backups / "devicectl-listings.json").write_text(json.dumps(device.listings, indent=1, default=str))
+
+
+def nothing_found(groups, backups):
+    return Failure(f"No sticker library found in {', '.join(groups)}. If Stickerize shows stickers on the phone, they are "
+                   f"somewhere this can't see: don't delete anything. Run this again with --verbose, and send the output "
+                   f"and {backups / 'devicectl-listings.json'}.")
 
 
 def backup(device, group, backups):
@@ -268,9 +302,12 @@ def main():
     parser.add_argument("--cli", type=pathlib.Path, help="a built stickerize tool (default: build it with swift build)")
     parser.add_argument("--backup-only", action="store_true",
                         help="only back up every Stickerize app's library; works before the new build is installed")
+    parser.add_argument("--verbose", action="store_true", help="show every devicectl command")
     parser.add_argument("--add-library", action="append", type=pathlib.Path, default=[], metavar="DIR",
                         help="also merge this Stickers folder on the Mac, e.g. a backup of an app since deleted (repeatable)")
     args = parser.parse_args()
+    global VERBOSE
+    VERBOSE = args.verbose
 
     if args.cli and not (args.cli.is_file() and os.access(args.cli, os.X_OK)):
         raise Failure(f"--cli: not an executable file: {args.cli}")
@@ -302,7 +339,12 @@ def main():
                 continue
             groups += [g for g in app.get("appGroupIdentifiers") or [] if g not in groups]
         backups = backup_folder(args)
-        copied = [group for group in groups if backup(device, group, backups)]
+        try:
+            copied = [group for group in groups if backup(device, group, backups)]
+        finally:
+            save_listings(device, backups)
+        if groups and not copied:
+            raise nothing_found(groups, backups)
         print(f"Backed up {len(copied)} librar{'y' if len(copied) == 1 else 'ies'}. Nothing on the phone was changed.")
         return
     target = by_id.get(target_id)
@@ -336,7 +378,10 @@ def main():
         return
 
     backups = backup_folder(args)
-    pulled = {group: folder for group in [target_group, *source_groups] for folder in [backup(device, group, backups)] if folder}
+    try:
+        pulled = {group: folder for group in [target_group, *source_groups] for folder in [backup(device, group, backups)] if folder}
+    finally:
+        save_listings(device, backups)
     if target_group in pulled and (pulled[target_group] / "manifest.json").exists():
         try:
             json.loads((pulled[target_group] / "manifest.json").read_text())
@@ -355,8 +400,7 @@ def main():
             shutil.copy2(path, merged / path.name)
     sources = sorted([*(pulled[g] for g in source_groups if g in pulled), *args.add_library], key=newest_sticker, reverse=True)
     if not sources:
-        print("The other apps have no stickers: nothing to move.")
-        return
+        raise nothing_found(source_groups, backups)
     cli = args.cli or build_cli()
     process = run([str(cli), "merge-library", *[str(s) for s in sources], "--into", str(merged)])
     if process.returncode != 0:
